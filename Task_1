@@ -1,0 +1,64 @@
+from matplotlib import use
+import pandas as pd
+import os
+from scipy.stats import poisson
+import numpy as np
+from pandas.core.arrays import period
+
+excel_file_path = 'ISyE 6202 + 6335 EasyNode Smart Locker Bank Casework  Fall 2025.xlsx'
+
+df_Deposit2Pickup = pd.read_excel(excel_file_path, sheet_name='Deposit2Pickup', skiprows=9, nrows=24, usecols='D:AB')
+
+space_req_prob = {
+    1: 0.08, 2: 0.12, 3: 0.15, 4: 0.12, 5: 0.08, 6: 0.06, 7: 0.05, 8: 0.05,
+    9: 0.05, 10: 0.04, 11: 0.04, 12: 0.03, 13: 0.03, 14: 0.03, 15: 0.02,
+    16: 0.02, 17: 0.02, 18: 0.01
+}
+
+prob_s = sum(p for ft, p in space_req_prob.items() if 1 <= ft <= 3)
+prob_m = sum(p for ft, p in space_req_prob.items() if 4 <= ft <= 9)
+prob_l = sum(p for ft, p in space_req_prob.items() if 10 <= ft <= 18)
+
+max_annual_demand = 150000  # From Year 5, Scenario 5.5
+peak_4_week_share = 0.13     # Period 13
+peak_day_of_week_share = 0.20 # Friday
+
+parcels_in_peak_period = max_annual_demand * peak_4_week_share
+avg_parcels_per_week_peak = parcels_in_peak_period / 4
+peak_day_arrivals = avg_parcels_per_week_peak * peak_day_of_week_share
+
+prob_matrix = df_Deposit2Pickup.iloc[:24, :24].values
+
+prob_matrix = prob_matrix / 10000.0
+
+total_duration = 0
+for d in range(24):
+    for p in range(24):
+        duration = (p -d) if p >= d else (p + 24 - d)
+
+        total_duration += prob_matrix[d, p] * duration
+
+avg_duration_hours = total_duration / np.sum(prob_matrix)
+
+arrival_rate_hourly = peak_day_arrivals / 24
+avg_occupied_lockers = arrival_rate_hourly * avg_duration_hours
+
+mu = avg_occupied_lockers
+target_occupancy_99_5 = poisson.ppf(0.995, mu)
+
+total_lockers_needed = int(target_occupancy_99_5)
+    
+num_s = round(total_lockers_needed * prob_s)
+num_m = round(total_lockers_needed * prob_m)
+num_l = round(total_lockers_needed * prob_l)
+
+grid_height = 15
+
+total_grid_units_needed = (num_s * 1) + (num_m * 2) + (num_l * 3)
+
+total_grid_units_needed += 2 * 6 
+
+required_width = np.ceil(total_grid_units_needed / grid_height)
+
+print(required_width)
+print(total_grid_units_needed, num_s, num_m, num_l)
