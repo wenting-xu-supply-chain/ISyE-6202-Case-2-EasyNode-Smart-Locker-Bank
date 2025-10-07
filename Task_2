@@ -1,4 +1,5 @@
 import numpy as np
+import matplotlib.pyplot as plt
 
 def generate_mixed_arrival_times(N, lsp_proportion=0.8, lsp_mean=15, lsp_std=5):
     """
@@ -35,9 +36,18 @@ def generate_mixed_arrival_times(N, lsp_proportion=0.8, lsp_mean=15, lsp_std=5):
     return list(all_times)
 
 # --- Demonstration ---
-num_arrivals = 10
+num_arrivals = 50 # Increased for a better visualization
 example_times = generate_mixed_arrival_times(num_arrivals, lsp_proportion=0.8)
 
-print(f"Generated mixed-model arrival times for {num_arrivals} packages (8 LSP, 2 Customer):")
-for i, time in enumerate(example_times):
-    print(f"  Package {i+1}: {time:.2f} minutes past the hour")
+# --- Visualization ---
+plt.figure(figsize=(10, 6))
+plt.hist(example_times, bins=60, color='skyblue', edgecolor='black')
+plt.title('Distribution of Package Arrival Times')
+plt.xlabel('Time (minutes past the hour)')
+plt.ylabel('Number of Packages')
+plt.grid(axis='y', alpha=0.75)
+plt.savefig('arrival_times_histogram.png')
+plt.show()
+
+print(f"Generated and visualized mixed-model arrival times for {num_arrivals} packages.")
+print("The histogram has been saved as 'arrival_times_histogram.png'")
