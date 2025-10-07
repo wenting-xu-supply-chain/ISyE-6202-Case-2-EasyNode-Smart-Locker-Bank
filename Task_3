@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import datetime
 import random
+import matplotlib.pyplot as plt
 
 # --- DATA FROM CASEWORK ---
 
@@ -243,6 +244,44 @@ def generate_package_details(daily_demand_df):
     return pd.DataFrame(all_packages)
 
 
+def visualize_demand_distribution(final_demand_instance):
+    """
+    Visualizes the demand distribution by locker category and average space utilization.
+    Always saves the figure to a PNG so it is available even in headless environments.
+    """
+    # Aggregate metrics
+    category_counts = final_demand_instance['Locker_Category'].value_counts().reindex(['small', 'medium', 'large'], fill_value=0)
+    avg_utilization = final_demand_instance.groupby('Locker_Category')['Space_Utilization'].mean().reindex(['small', 'medium', 'large'])
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    # Left: counts
+    axes[0].bar(category_counts.index, category_counts.values, color=['#FFC300', '#FF5733', '#C70039'])
+    axes[0].set_xlabel('Locker Category')
+    axes[0].set_ylabel('Number of Demands')
+    axes[0].set_title('Demand Count by Category')
+
+    # Right: average utilization
+    axes[1].bar(avg_utilization.index, avg_utilization.values, color=['#6CC24A', '#3498DB', '#9B59B6'])
+    axes[1].set_xlabel('Locker Category')
+    axes[1].set_ylabel('Average Space Utilization')
+    axes[1].set_ylim(0, 1)
+    axes[1].set_title('Average Space Utilization')
+
+    plt.tight_layout()
+
+    # Save figure to disk for robustness
+    output_path = "locker_demand_distribution.png"
+    plt.savefig(output_path, dpi=150)
+
+    try:
+        # Attempt to show if a display backend is available
+        plt.show()
+    finally:
+        plt.close(fig)
+
+    print(f"Visualization saved to '{output_path}'")
+
 def main():
     """
     Main function to run the full demand simulation process.
@@ -276,6 +315,8 @@ def main():
     # 计算平均空间利用率
     avg_utilization = final_demand_instance['Space_Utilization'].mean()
     print(f"\nAverage space utilization: {avg_utilization:.1%}")
+
+    visualize_demand_distribution(final_demand_instance)
 
 
 if __name__ == "__main__":
