@@ -1,0 +1,282 @@
+import pandas as pd
+import numpy as np
+import datetime
+import random
+
+# --- DATA FROM CASEWORK ---
+
+# Table 1: Package Space Requirement Probabilities
+SIZE_PROBABILITY = {
+    1: 0.08, 2: 0.12, 3: 0.15, 4: 0.12, 5: 0.08, 6: 0.06, 7: 0.05,
+    8: 0.05, 9: 0.05, 10: 0.04, 11: 0.04, 12: 0.03, 13: 0.03,
+    14: 0.03, 15: 0.02, 16: 0.02, 17: 0.02, 18: 0.01
+}
+
+# ===== 简化的三类储物柜尺寸系统 =====
+# 这个设计将18种包裹尺寸归类为3种标准储物柜
+SPACE_REQUIREMENT_PROB = {
+    'small': sum([0.08, 0.12, 0.15]),                          # 1-3 ft³, 概率35%
+    'medium': sum([0.12, 0.08, 0.06, 0.05, 0.05, 0.05]),      # 4-9 ft³, 概率41%
+    'large': sum([0.04, 0.04, 0.03, 0.03, 0.03, 0.02, 0.02, 0.02, 0.01]) # 10-18 ft³, 概率24%
+}
+
+# 定义每个类别的标准储物柜规格
+# 格式：类别名 -> (网格尺寸描述, 长, 宽, 高, 容量)
+LOCKER_SPECIFICATIONS = {
+    'small': ('1×1×3', 1, 1, 3, 3),      # 3 ft³ 可容纳 1-3 ft³ 包裹
+    'medium': ('1×3×3', 1, 3, 3, 9),     # 9 ft³ 可容纳 4-9 ft³ 包裹  
+    'large': ('2×3×3', 2, 3, 3, 18)      # 18 ft³ 可容纳 10-18 ft³ 包裹
+}
+
+# 创建从具体尺寸到储物柜类别的映射
+# 这样当我们随机生成一个具体的required_size时，可以快速查找它属于哪个类别
+SIZE_TO_CATEGORY = {}
+for size in range(1, 4):      # 1-3 ft³ 归为 small
+    SIZE_TO_CATEGORY[size] = 'small'
+for size in range(4, 10):     # 4-9 ft³ 归为 medium
+    SIZE_TO_CATEGORY[size] = 'medium'
+for size in range(10, 19):    # 10-18 ft³ 归为 large
+    SIZE_TO_CATEGORY[size] = 'large'
+
+print("=== Locker Bank Configuration ===")
+print(f"Small lockers (1-3 ft³): {SPACE_REQUIREMENT_PROB['small']:.1%} of demand")
+print(f"Medium lockers (4-9 ft³): {SPACE_REQUIREMENT_PROB['medium']:.1%} of demand")
+print(f"Large lockers (10-18 ft³): {SPACE_REQUIREMENT_PROB['large']:.1%} of demand")
+print()
+# ===== 储物柜配置定义结束 =====
+
+# Table 2: Temporal Demand Shares and Variation
+PERIOD_DEMAND_SHARE = {
+    1: 0.03, 2: 0.05, 3: 0.06, 4: 0.07, 5: 0.11, 6: 0.06, 7: 0.04,
+    8: 0.10, 9: 0.10, 10: 0.06, 11: 0.08, 12: 0.11, 13: 0.13
+}
+# Day of week mapping: Monday=0, Sunday=6
+DAY_OF_WEEK_SHARE = {
+    6: 0.07, 0: 0.13, 1: 0.12, 2: 0.15, 3: 0.18, 4: 0.20, 5: 0.15
+}
+DAILY_DEMAND_CV = 0.25
+
+# Figure 1: Yearly Demand Scenarios
+SCENARIO_TREE = {
+    'start': [('1.1', 0.25), ('1.2', 0.25), ('1.3', 0.5)],
+    '1.1': [('2.1', 0.3), ('2.2', 0.4), ('2.3', 0.3)],
+    '1.2': [('2.2', 0.6), ('2.3', 0.4)],
+    '1.3': [('2.4', 0.6), ('2.5', 0.4)],
+    '2.1': [('3.1', 0.5), ('3.2', 0.5)],
+    '2.2': [('3.1', 0.3), ('3.2', 0.4), ('3.3', 0.3)],
+    '2.3': [('3.2', 0.6), ('3.3', 0.4)],
+    '2.4': [('3.4', 0.6), ('3.5', 0.4)],
+    '2.5': [('3.4', 0.4), ('3.5', 0.6)],
+    '3.1': [('4.1', 0.5), ('4.2', 0.5)],
+    '3.2': [('4.1', 0.3), ('4.2', 0.4), ('4.3', 0.3)],
+    '3.3': [('4.2', 0.6), ('4.3', 0.4)],
+    '3.4': [('4.3', 0.1), ('4.4', 0.6), ('4.5', 0.3)],
+    '3.5': [('4.4', 0.4), ('4.5', 0.6)],
+    '4.1': [('5.1', 0.5), ('5.2', 0.5)],
+    '4.2': [('5.1', 0.3), ('5.2', 0.4), ('5.3', 0.3)],
+    '4.3': [('5.2', 0.6), ('5.3', 0.4)],
+    '4.4': [('5.3', 0.25), ('5.4', 0.75)],
+    '4.5': [('5.4', 0.4), ('5.5', 0.6)]
+}
+
+SCENARIO_DEMANDS = {
+    '1.1': 50000, '1.2': 60000, '1.3': 80000,
+    '2.1': 60000, '2.2': 65000, '2.3': 70000, '2.4': 90000, '2.5': 100000,
+    '3.1': 60000, '3.2': 70000, '3.3': 75000, '3.4': 100000, '3.5': 110000,
+    '4.1': 60000, '4.2': 75000, '4.3': 80000, '4.4': 105000, '4.5': 120000,
+    '5.1': 60000, '5.2': 65000, '5.3': 90000, '5.4': 110000, '5.5': 150000
+}
+
+# Table 3: Deposit and Pickup distributions
+DAILY_DEPOSIT_DIST = np.array([200, 200, 100, 100, 300, 300, 400, 400, 600, 600, 600, 600, 400, 600, 800, 600, 600, 500, 500, 400, 200, 200, 200, 200])
+DAILY_PICKUP_DIST = np.array([103, 22, 38, 28, 141, 280, 547, 710, 521, 424, 506, 560, 558, 496, 517, 610, 786, 790, 720, 626, 495, 289, 183, 0])
+DEPOSIT_HOUR_PROBS = DAILY_DEPOSIT_DIST / DAILY_DEPOSIT_DIST.sum()
+PICKUP_HOUR_PROBS = DAILY_PICKUP_DIST / DAILY_PICKUP_DIST.sum()
+
+def simulate_annual_demand_path():
+    """
+    Simulates a 5-year demand path through the scenario tree from Figure 1.
+
+    Returns:
+        list: A list of 5 integers representing the total annual demand for each year.
+    """
+    print("Simulating 5-year annual demand path...")
+    annual_demands = []
+    current_node = 'start'
+
+    for year in range(5):
+        next_states = SCENARIO_TREE[current_node]
+        nodes = [state[0] for state in next_states]
+        probabilities = [state[1] for state in next_states]
+
+        chosen_node = np.random.choice(nodes, p=probabilities)
+        demand = SCENARIO_DEMANDS[chosen_node]
+        annual_demands.append(demand)
+        current_node = chosen_node
+
+    print(f"  -> Simulated annual demands: {annual_demands}")
+    return annual_demands
+
+def generate_daily_demands(annual_demands):
+    """
+    Distributes annual demands into daily demands for the 5-year period.
+
+    Args:
+        annual_demands (list): List of 5 integers for annual demands.
+
+    Returns:
+        pd.DataFrame: A DataFrame with columns ['date', 'demand_count'].
+    """
+    print("Distributing annual demand to daily demand...")
+    start_date = datetime.date(2026, 1, 1)
+    end_date = start_date + datetime.timedelta(days=int(5 * 365.25) - 1)
+    
+    date_range = pd.to_datetime(pd.date_range(start=start_date, end=end_date, freq='D'))
+    daily_demand_df = pd.DataFrame(date_range, columns=['date'])
+
+    daily_demands = []
+    for date in daily_demand_df['date']:
+        year_index = date.year - start_date.year
+        day_of_year = date.dayofyear
+        
+        period = (day_of_year - 1) // 28 + 1
+        if period > 13:
+            period = 13
+            
+        day_of_week = date.dayofweek
+
+        mean_demand = (annual_demands[year_index] *
+                       PERIOD_DEMAND_SHARE[period] *
+                       DAY_OF_WEEK_SHARE[day_of_week])
+
+        std_dev = mean_demand * DAILY_DEMAND_CV
+
+        demand_count = max(0, int(round(np.random.normal(mean_demand, std_dev))))
+        daily_demands.append(demand_count)
+
+    daily_demand_df['demand_count'] = daily_demands
+    print(f"  -> Generated daily demands for {len(daily_demand_df)} days.")
+    return daily_demand_df
+
+def generate_package_details(daily_demand_df):
+    """
+    Generates detailed attributes for each package demand.
+
+    Args:
+        daily_demand_df (pd.DataFrame): DataFrame with daily demand counts.
+
+    Returns:
+        pd.DataFrame: A DataFrame with detailed info for each package demand instance.
+    """
+    print("Generating detailed attributes for each package...")
+    all_packages = []
+    package_id_counter = 1
+    
+    sizes = list(SIZE_PROBABILITY.keys())
+    size_probs = list(SIZE_PROBABILITY.values())
+    
+    hours = np.arange(24)
+
+    for _, row in daily_demand_df.iterrows():
+        num_packages = row['demand_count']
+        if num_packages == 0:
+            continue
+
+        for _ in range(num_packages):
+            # 1. 生成包裹所需的具体立方英尺数
+            required_size = np.random.choice(sizes, p=size_probs)
+            
+            # 2. 根据所需尺寸确定储物柜类别和规格
+            # 使用我们定义的映射来查找这个尺寸应该分配到哪个类别
+            locker_category = SIZE_TO_CATEGORY[required_size]
+            
+            # 从储物柜规格表中获取该类别的详细信息
+            grid_size, length, width, height, capacity = LOCKER_SPECIFICATIONS[locker_category]
+
+            # 3. 分配期望的存取时间
+            while True:
+                deposit_hour = np.random.choice(hours, p=DEPOSIT_HOUR_PROBS)
+                pickup_hour = np.random.choice(hours, p=PICKUP_HOUR_PROBS)
+                
+                deposit_minute = random.randint(0, 59)
+                pickup_minute = random.randint(0, 59)
+                
+                desired_deposit_time = row['date'].replace(hour=int(deposit_hour), minute=deposit_minute, second=0, microsecond=0)
+                
+                hour_diff = (pickup_hour - deposit_hour + 24) % 24
+                day_offset = 1 if pickup_hour <= deposit_hour else 0
+                day_offset += random.randint(0, 3) 
+                
+                desired_pickup_time = desired_deposit_time + \
+                    datetime.timedelta(days=int(day_offset), hours=int(hour_diff))
+                desired_pickup_time = desired_pickup_time.replace(minute=pickup_minute)
+                
+                if desired_pickup_time > desired_deposit_time:
+                    break
+            
+            # 4. 计算实际的存取时间（考虑偏差）
+            deviation_minutes = random.uniform(-90, 180 * 60)
+            actual_deposit_time = desired_deposit_time + datetime.timedelta(minutes=deviation_minutes)
+            
+            if actual_deposit_time >= desired_pickup_time:
+                actual_deposit_time = desired_deposit_time - datetime.timedelta(minutes=1)
+
+            late_pickup_minutes = np.random.exponential(scale=180)
+            actual_pickup_time = desired_pickup_time + datetime.timedelta(minutes=late_pickup_minutes)
+            
+            # 5. 记录完整的包裹和储物柜信息
+            all_packages.append({
+                'Demand_ID': package_id_counter,
+                'Required_Size_ft3': required_size,               # 包裹实际需要的空间
+                'Locker_Category': locker_category,               # 储物柜类别 (small/medium/large)
+                'Locker_Grid_Size': grid_size,                    # 储物柜网格尺寸描述
+                'Locker_Capacity_ft3': capacity,                  # 储物柜实际容量
+                'Space_Utilization': required_size / capacity,    # 空间利用率
+                'Desired_Deposit_Time': desired_deposit_time,
+                'Desired_Pickup_Time': desired_pickup_time,
+                'Actual_Deposit_Time': actual_deposit_time,
+                'Actual_Pickup_Time': actual_pickup_time
+            })
+            package_id_counter += 1
+
+    print(f"  -> Generated {len(all_packages)} total package demands.")
+    return pd.DataFrame(all_packages)
+
+
+def main():
+    """
+    Main function to run the full demand simulation process.
+    """
+    print("--- Starting EasyNode Demand Simulator for Task 3 ---")
+    
+    annual_demands = simulate_annual_demand_path()
+    daily_demands_df = generate_daily_demands(annual_demands)
+    final_demand_instance = generate_package_details(daily_demands_df)
+    
+    output_filename = "demand_instance.csv"
+    final_demand_instance.to_csv(output_filename, index=False)
+    
+    print(f"\n--- Simulation Complete ---")
+    print(f"Total demands generated: {len(final_demand_instance)}")
+    print(f"Output saved to '{output_filename}'")
+    print("\nFirst 5 rows of the generated demand instance:")
+    print(final_demand_instance.head())
+    
+    # 显示储物柜类别的需求分布统计
+    print("\n--- Locker Category Demand Distribution ---")
+    category_counts = final_demand_instance['Locker_Category'].value_counts()
+    category_percentages = final_demand_instance['Locker_Category'].value_counts(normalize=True)
+    
+    for category in ['small', 'medium', 'large']:
+        count = category_counts.get(category, 0)
+        percentage = category_percentages.get(category, 0)
+        spec = LOCKER_SPECIFICATIONS[category]
+        print(f"{category.capitalize():8s} ({spec[0]}): {count:6d} demands ({percentage:6.1%})")
+    
+    # 计算平均空间利用率
+    avg_utilization = final_demand_instance['Space_Utilization'].mean()
+    print(f"\nAverage space utilization: {avg_utilization:.1%}")
+
+
+if __name__ == "__main__":
+    main()
