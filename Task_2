@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import os ### MODIFICATION: Import the os module ###
 
 def generate_mixed_arrival_times(N, lsp_proportion=0.8, lsp_mean=15, lsp_std=5):
     """
@@ -36,7 +37,7 @@ def generate_mixed_arrival_times(N, lsp_proportion=0.8, lsp_mean=15, lsp_std=5):
     return list(all_times)
 
 # --- Demonstration ---
-num_arrivals = 50 # Increased for a better visualization
+num_arrivals = 1000 # Increased for a better visualization
 example_times = generate_mixed_arrival_times(num_arrivals, lsp_proportion=0.8)
 
 # --- Visualization ---
@@ -46,8 +47,21 @@ plt.title('Distribution of Package Arrival Times')
 plt.xlabel('Time (minutes past the hour)')
 plt.ylabel('Number of Packages')
 plt.grid(axis='y', alpha=0.75)
-plt.savefig('arrival_times_histogram.png')
+
+### MODIFICATION START ###
+# Create the output folder and define the full file path
+output_folder = "Task_2_Outcome"
+os.makedirs(output_folder, exist_ok=True) # Creates the folder if it doesn't exist
+
+filename = 'arrival_times_histogram.png'
+output_filepath = os.path.join(output_folder, filename)
+
+# Save the plot to the new path
+plt.savefig(output_filepath)
+### MODIFICATION END ###
+
 plt.show()
 
 print(f"Generated and visualized mixed-model arrival times for {num_arrivals} packages.")
-print("The histogram has been saved as 'arrival_times_histogram.png'")
+### MODIFICATION: Update the print statement to show the new path ###
+print(f"The histogram has been saved as '{output_filepath}'")
