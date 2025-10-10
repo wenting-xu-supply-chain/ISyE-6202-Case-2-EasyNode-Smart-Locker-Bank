@@ -2,42 +2,31 @@ import pandas as pd
 import numpy as np
 import datetime
 import random
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# --- DATA AND HELPER FUNCTIONS (大部分保持不变) ---
+# =============================================================================
+# --- Section 1: Constants from Casework Document ---
+# =============================================================================
 
-# ... (此处省略之前未变动的所有数据和函数定义) ...
 # Table 1: Package Space Requirement Probabilities
 SIZE_PROBABILITY = {
     1: 0.08, 2: 0.12, 3: 0.15, 4: 0.12, 5: 0.08, 6: 0.06, 7: 0.05,
     8: 0.05, 9: 0.05, 10: 0.04, 11: 0.04, 12: 0.03, 13: 0.03,
     14: 0.03, 15: 0.02, 16: 0.02, 17: 0.02, 18: 0.01
 }
-# ===== 简化的三类储物柜尺寸系统 =====
-SPACE_REQUIREMENT_PROB = {
-    'small': sum([0.08, 0.12, 0.15]),
-    'medium': sum([0.12, 0.08, 0.06, 0.05, 0.05, 0.05]),
-    'large': sum([0.04, 0.04, 0.03, 0.03, 0.03, 0.02, 0.02, 0.02, 0.01])
-}
-LOCKER_SPECIFICATIONS = {
-    'small': ('1×1×3', 1, 1, 3, 3),
-    'medium': ('1×3×3', 1, 3, 3, 9),
-    'large': ('2×3×3', 2, 3, 3, 18)
-}
-SIZE_TO_CATEGORY = {}
-for size in range(1, 4): SIZE_TO_CATEGORY[size] = 'small'
-for size in range(4, 10): SIZE_TO_CATEGORY[size] = 'medium'
-for size in range(10, 19): SIZE_TO_CATEGORY[size] = 'large'
+SIZES = list(SIZE_PROBABILITY.keys())
+SIZE_PROBS = list(SIZE_PROBABILITY.values())
+
 # Table 2: Temporal Demand Shares and Variation
 PERIOD_DEMAND_SHARE = {
     1: 0.03, 2: 0.05, 3: 0.06, 4: 0.07, 5: 0.11, 6: 0.06, 7: 0.04,
     8: 0.10, 9: 0.10, 10: 0.06, 11: 0.08, 12: 0.11, 13: 0.13
 }
 DAY_OF_WEEK_SHARE = {
-    6: 0.07, 0: 0.13, 1: 0.12, 2: 0.15, 3: 0.18, 4: 0.20, 5: 0.15
+    0: 0.13, 1: 0.12, 2: 0.15, 3: 0.18, 4: 0.20, 5: 0.15, 6: 0.07  # Monday=0, Sunday=6
 }
 DAILY_DEMAND_CV = 0.25
+
 # Figure 1: Yearly Demand Scenarios
 SCENARIO_TREE = {
     'start': [('1.1', 0.25), ('1.2', 0.25), ('1.3', 0.5)], '1.1': [('2.1', 0.3), ('2.2', 0.4), ('2.3', 0.3)],
@@ -54,16 +43,32 @@ SCENARIO_DEMANDS = {
     '3.1': 60000, '3.2': 70000, '3.3': 75000, '3.4': 100000, '3.5': 110000, '4.1': 60000, '4.2': 75000, '4.3': 80000,
     '4.4': 105000, '4.5': 120000, '5.1': 60000, '5.2': 65000, '5.3': 90000, '5.4': 110000, '5.5': 150000
 }
-# Table 3: Deposit and Pickup distributions
-DAILY_DEPOSIT_DIST = np.array([200, 200, 100, 100, 300, 300, 400, 400, 600, 600, 600, 600, 400, 600, 800, 600, 600, 500, 500, 400, 200, 200, 200, 200])
-DAILY_PICKUP_DIST = np.array([103, 22, 38, 28, 141, 280, 547, 710, 521, 424, 506, 560, 558, 496, 517, 610, 786, 790, 720, 626, 495, 289, 183, 0])
-DEPOSIT_HOUR_PROBS = DAILY_DEPOSIT_DIST / DAILY_DEPOSIT_DIST.sum()
-PICKUP_HOUR_PROBS = DAILY_PICKUP_DIST / DAILY_PICKUP_DIST.sum()
 
-def simulate_annual_demand_path(verbose=False):
+# --- START OF FIX ---
+# Table 3: Deposit and Pickup distributions.
+# Normalizing the distributions by their sum to guarantee they sum to 1.
+DAILY_DEPOSIT_DIST = np.array([200, 200, 100, 100, 300, 300, 400, 400, 600, 600, 600, 600, 400, 600, 800, 600, 600, 500, 500, 400, 200, 200, 200, 200])
+DEPOSIT_HOUR_PROBS = DAILY_DEPOSIT_DIST / DAILY_DEPOSIT_DIST.sum()
+
+DAILY_PICKUP_DIST = np.array([103, 22, 38, 28, 141, 280, 547, 710, 521, 424, 506, 560, 558, 496, 517, 610, 786, 790, 720, 626, 495, 289, 183, 0])
+PICKUP_HOUR_PROBS = DAILY_PICKUP_DIST / DAILY_PICKUP_DIST.sum()
+# --- END OF FIX ---
+
+
+# Other Parameters
+START_YEAR = 2026
+
+# =============================================================================
+# --- Section 2: Helper Functions ---
+# =============================================================================
+
+def _simulate_annual_demand_path() -> list[int]:
+    """
+    Simulates a single 5-year demand path through the scenario tree.
+    """
     annual_demands = []
     current_node = 'start'
-    for year in range(5):
+    for _ in range(5):
         next_states = SCENARIO_TREE[current_node]
         nodes = [state[0] for state in next_states]
         probabilities = [state[1] for state in next_states]
@@ -71,141 +76,166 @@ def simulate_annual_demand_path(verbose=False):
         demand = SCENARIO_DEMANDS[chosen_node]
         annual_demands.append(demand)
         current_node = chosen_node
-    if verbose:
-        print(f"  -> Simulated annual demands: {annual_demands}")
     return annual_demands
 
-def generate_daily_demands(annual_demands):
-    start_date = datetime.date(2026, 1, 1)
+def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> list[dict]:
+    """
+    Generates a list of package demand instances for a single day.
+    """
+    if num_packages <= 0:
+        return []
+        
+    package_list = []
+    
+    # Generate all random variables in batches for efficiency
+    required_sizes = np.random.choice(SIZES, size=num_packages, p=SIZE_PROBS)
+    deposit_hours = np.random.choice(24, size=num_packages, p=DEPOSIT_HOUR_PROBS)
+    pickup_hours = np.random.choice(24, size=num_packages, p=PICKUP_HOUR_PROBS)
+    deposit_offsets_hours = [random.uniform(-1.5, 180.0) for _ in range(num_packages)]
+    pickup_offsets_hours = [random.uniform(-6.0, 6.0) for _ in range(num_packages)]
+    
+    for i in range(num_packages):
+        desired_deposit_dt = datetime.datetime.combine(date, datetime.time(hour=deposit_hours[i]))
+        
+        pickup_date = date
+        if pickup_hours[i] < deposit_hours[i]:
+            pickup_date += datetime.timedelta(days=1) 
+        desired_pickup_dt = datetime.datetime.combine(pickup_date, datetime.time(hour=pickup_hours[i]))
+        
+        real_deposit_dt = desired_deposit_dt + datetime.timedelta(hours=deposit_offsets_hours[i])
+        
+        if real_deposit_dt >= desired_pickup_dt:
+            real_deposit_dt = desired_pickup_dt - datetime.timedelta(hours=1)
+            
+        real_pickup_dt = desired_pickup_dt + datetime.timedelta(hours=pickup_offsets_hours[i])
+        
+        package_list.append({
+            'min_size_ft3': required_sizes[i],
+            'desired_deposit_dt': desired_deposit_dt,
+            'desired_pickup_dt': desired_pickup_dt,
+            'real_deposit_dt': real_deposit_dt,
+            'real_pickup_dt': real_pickup_dt
+        })
+        
+    return package_list
+
+# =============================================================================
+# --- Section 3: Main Simulator Function ---
+# =============================================================================
+
+def generate_five_year_demand_instance() -> pd.DataFrame:
+    """
+    Develops a locker bank demand simulator that generates instances of dynamic 
+    demand across the five-year horizon.
+    """
+    print("--- Starting 5-Year Dynamic Demand Simulation ---")
+    
+    annual_demands = _simulate_annual_demand_path()
+    print(f"Simulated Annual Demand Path: {annual_demands}")
+
+    start_date = datetime.date(START_YEAR, 1, 1)
     end_date = start_date + datetime.timedelta(days=int(5 * 365.25) - 1)
     date_range = pd.to_datetime(pd.date_range(start=start_date, end=end_date, freq='D'))
+    
     daily_demand_df = pd.DataFrame(date_range, columns=['date'])
-    daily_demands = []
-    # 【修改】我们只需要年度总需求，不需要每日那么细致，所以这里直接返回年度需求
-    total_packages_per_year = []
-    for year, annual_demand_mean in enumerate(annual_demands):
-        # 为了简化和加速，我们假设年度总需求也遵循一个正态分布
-        # 这里的标准差可以根据业务理解来设定，我们用一个简化值
-        annual_std_dev = annual_demand_mean * 0.1 
-        num_packages = int(round(np.random.normal(annual_demand_mean, annual_std_dev)))
-        total_packages_per_year.append(num_packages)
-    return total_packages_per_year
-
-def generate_package_details(total_packages):
-    # 【修改】这个函数现在只用来生成类别，输入为总包裹数
-    if total_packages == 0:
-        return pd.DataFrame()
-    sizes = list(SIZE_PROBABILITY.keys())
-    size_probs = list(SIZE_PROBABILITY.values())
+    daily_demand_df['year'] = daily_demand_df['date'].dt.year
+    daily_demand_df['period'] = ((daily_demand_df['date'].dt.dayofyear - 1) // 28) + 1
+    daily_demand_df['period'] = daily_demand_df['period'].clip(upper=13)
+    daily_demand_df['day_of_week'] = daily_demand_df['date'].dt.dayofweek
     
-    required_sizes = np.random.choice(sizes, size=total_packages, p=size_probs)
-    locker_categories = [SIZE_TO_CATEGORY[size] for size in required_sizes]
-    
-    return pd.DataFrame({'Locker_Category': locker_categories})
-
-def run_single_simulation():
-    """
-    运行一次完整的5年模拟并返回关键指标。
-    """
-    # 1. 模拟5年路径的“期望”年需求
-    annual_demand_means = simulate_annual_demand_path()
-    
-    # 2. 【修改】根据“期望”年需求，生成带一些随机性的实际年需求
-    # 为了简化，我们直接在这里处理年度总包裹数
-    total_packages_per_year = []
-    for mean_demand in annual_demand_means:
-        # 我们可以认为年总需求也有波动，这里用一个简化的变异系数
-        std_dev = mean_demand * 0.05 
-        actual_demand = max(0, int(round(np.random.normal(mean_demand, std_dev))))
-        total_packages_per_year.append(actual_demand)
-
-    # 3. 生成包裹细节
-    total_packages_all_years = sum(total_packages_per_year)
-    package_details_df = generate_package_details(total_packages_all_years)
-    
-    if package_details_df.empty:
-        return {
-            'annual_demands': [0, 0, 0, 0, 0],
-            'small_perc': 0, 'medium_perc': 0, 'large_perc': 0
-        }
-
-    category_dist = package_details_df['Locker_Category'].value_counts(normalize=True)
-    
-    # 【修改】返回结果中包含年度需求列表
-    return {
-        'annual_demands': total_packages_per_year,
-        'small_perc': category_dist.get('small', 0),
-        'medium_perc': category_dist.get('medium', 0),
-        'large_perc': category_dist.get('large', 0)
-    }
-
-def main():
-    """
-    主函数，运行N次蒙特卡洛模拟并报告平均结果。
-    """
-    N_SIMULATIONS = 100 # 增加模拟次数以获得更稳定的年度结果
-    
-    print(f"--- Starting Monte Carlo Simulation ({N_SIMULATIONS} runs) ---")
-    
-    results = []
-    
-    # =======================================================
-    # == 这里就是实现进度条的关键，使用 tqdm 包装循环 ==
-    # =======================================================
-    for _ in tqdm(range(N_SIMULATIONS), desc="Simulating"):
-        result = run_single_simulation()
-        results.append(result)
+    all_years_dfs = []
+    for year_idx, total_annual_demand in enumerate(annual_demands):
+        year = START_YEAR + year_idx
+        year_df = daily_demand_df[daily_demand_df['year'] == year].copy()
         
-    results_df = pd.DataFrame(results)
-    
-    print("\n--- Monte Carlo Simulation Complete ---")
-    print("\n=== Average Results over", N_SIMULATIONS, "simulations ===")
-    
-    # 【新增】处理年度需求
-    # 将包含列表的 'annual_demands' 列展开成一个独立的数据框
-    annual_demands_df = pd.DataFrame(
-        results_df['annual_demands'].tolist(), 
-        columns=['Year 1', 'Year 2', 'Year 3', 'Year 4', 'Year 5']
-    )
-    
-    # 计算每一年的平均需求
-    avg_annual_demands = annual_demands_df.mean()
-    print("\nAverage Demand per Year (Expected Path):")
-    for year, avg_demand in avg_annual_demands.items():
-        print(f"  {year}: {avg_demand:,.0f} packages")
+        if len(year_df) == 0:
+            continue
+            
+        mean_daily_demand = total_annual_demand / len(year_df)
+        
+        year_df['period_share'] = year_df['period'].map(PERIOD_DEMAND_SHARE)
+        year_df['dow_share'] = year_df['day_of_week'].map(DAY_OF_WEEK_SHARE)
 
-    # 计算总需求的平均值
-    total_demand_across_runs = annual_demands_df.sum(axis=1)
-    avg_total_demand = total_demand_across_runs.mean()
-    print(f"\nAverage 5-Year Total Demand: {avg_total_demand:,.0f} packages")
-    
-    # 计算储物柜平均分布
-    avg_small_perc = results_df['small_perc'].mean()
-    avg_medium_perc = results_df['medium_perc'].mean()
-    avg_large_perc = results_df['large_perc'].mean()
-    print("\nAverage Locker Category Distribution:")
-    print(f"  Small:  {avg_small_perc:.2%}")
-    print(f"  Medium: {avg_medium_perc:.2%}")
-    print(f"  Large:  {avg_large_perc:.2%}")
+        avg_period_share = year_df['period_share'].mean()
+        avg_dow_share = year_df['dow_share'].mean()
+        
+        year_df['expected_demand'] = (mean_daily_demand * (year_df['period_share'] / avg_period_share) *
+                                      (year_df['dow_share'] / avg_dow_share))
 
-    # 【新增】使用箱形图可视化每年的需求分布
-    plt.figure(figsize=(12, 7))
-    annual_demands_df.plot(kind='box', vert=True) # vert=True让箱形图垂直
-    plt.title(f'Distribution of Annual Demand ({N_SIMULATIONS} simulations)')
-    plt.ylabel('Number of Packages')
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.xticks(rotation=0) # 保持x轴标签水平
-    
-    output_path = "monte_carlo_annual_distribution.png"
-    plt.savefig(output_path, dpi=150)
-    print(f"\nAnnual distribution plot saved to '{output_path}'")
-    try:
-        # 使用 plt.show() 可以在脚本运行结束后弹窗显示图像
-        # 如果在非交互式环境（如服务器）运行，可以注释掉这行
-        plt.show()
-    finally:
-        # 确保图形被关闭，释放内存
-        plt.close()
+        std_dev = year_df['expected_demand'] * DAILY_DEMAND_CV
+        year_df['simulated_demand'] = np.random.normal(year_df['expected_demand'], std_dev)
+        
+        year_df['simulated_demand'] = year_df['simulated_demand'].fillna(0).round().astype(int).clip(lower=0)
+        
+        current_sum = year_df['simulated_demand'].sum()
+        if current_sum > 0:
+            scale_factor = total_annual_demand / current_sum
+            year_df['final_daily_demand'] = (year_df['simulated_demand'] * scale_factor).round().astype(int)
+        else:
+            year_df['final_daily_demand'] = 0
+        
+        remainder = total_annual_demand - year_df['final_daily_demand'].sum()
+        if remainder > 0:
+            demand_values = year_df['final_daily_demand'].values
+            add_indices = np.random.choice(demand_values.size, size=remainder, replace=True)
+            np.add.at(demand_values, add_indices, 1)
+            year_df['final_daily_demand'] = demand_values
+            
+        all_years_dfs.append(year_df)
 
-if __name__ == "__main__":
-    main()
+    if not all_years_dfs:
+         return pd.DataFrame()
+
+    daily_demand_df = pd.concat(all_years_dfs)
+    
+    all_packages = []
+    print("\nGenerating individual package details for each day...")
+    for _, row in tqdm(daily_demand_df.iterrows(), total=len(daily_demand_df), desc="Daily Progress"):
+        num_packages_today = row['final_daily_demand']
+        if num_packages_today > 0:
+            packages_today = _generate_packages_for_one_day(int(num_packages_today), row['date'].date())
+            all_packages.extend(packages_today)
+            
+    print("\nSimulation complete. Finalizing DataFrame.")
+    demand_instance_df = pd.DataFrame(all_packages)
+    
+    if not demand_instance_df.empty:
+        demand_instance_df.insert(0, 'package_id', range(1, len(demand_instance_df) + 1))
+    
+    return demand_instance_df
+
+# =============================================================================
+# --- Section 4: Execution Block ---
+# =============================================================================
+if __name__ == '__main__':
+    # Add the 'os' import at the very top of your script
+    import os
+    
+    # Generate one full instance of the 5-year demand
+    demand_df = generate_five_year_demand_instance()
+    
+    if not demand_df.empty:
+        print("\n\n--- Simulation Output ---")
+        print(f"Successfully generated {len(demand_df):,} package demand instances over 5 years.")
+        
+        print("\nDataFrame Info:")
+        demand_df.info()
+        
+        print("\nSample of Generated Demand Data (First 5 rows):")
+        print(demand_df.head())
+        
+        print("\nDescriptive Statistics for Package Size:")
+        print(demand_df['min_size_ft3'].describe())
+        
+        # --- Create an output folder and define the output path ---
+        output_folder = "Task_3_Outcome"
+        os.makedirs(output_folder, exist_ok=True) # This creates the folder
+
+        filename = "task3_demand_instance.csv"
+        output_filepath = os.path.join(output_folder, filename)
+        
+        # Save the output to the new folder
+        demand_df.to_csv(output_filepath, index=False)
+        print(f"\n✅ Full demand instance saved to '{output_filepath}'")
+    else:
+        print("\n--- Simulation resulted in an empty demand set. ---")
