@@ -9,7 +9,11 @@ import os
 # --- Section 1: Constants from Casework Document ---
 # =============================================================================
 
-# (Constants remain the same as before)
+# (Constants remain mostly the same)
+### NEW: Added PERIOD_CV constant ###
+PERIOD_CV = 0.2
+DAILY_DEMAND_CV = 0.25
+
 SIZE_PROBABILITY = {
     1: 0.08, 2: 0.12, 3: 0.15, 4: 0.12, 5: 0.08, 6: 0.06, 7: 0.05,
     8: 0.05, 9: 0.05, 10: 0.04, 11: 0.04, 12: 0.03, 13: 0.03,
@@ -24,7 +28,6 @@ PERIOD_DEMAND_SHARE = {
 DAY_OF_WEEK_SHARE = {
     0: 0.13, 1: 0.12, 2: 0.15, 3: 0.18, 4: 0.20, 5: 0.15, 6: 0.07
 }
-DAILY_DEMAND_CV = 0.25
 SCENARIO_TREE = {
     'start': [('1.1', 0.25), ('1.2', 0.25), ('1.3', 0.5)], '1.1': [('2.1', 0.3), ('2.2', 0.4), ('2.3', 0.3)],
     '1.2': [('2.2', 0.6), ('2.3', 0.4)], '1.3': [('2.4', 0.6), ('2.5', 0.4)], '2.1': [('3.1', 0.5), ('3.2', 0.5)],
@@ -47,121 +50,79 @@ PICKUP_HOUR_PROBS = DAILY_PICKUP_DIST / DAILY_PICKUP_DIST.sum()
 START_YEAR = 2026
 
 # =============================================================================
-# --- Section 2: Helper Functions ---
+# --- Section 2: Helper Functions (No changes in this section) ---
 # =============================================================================
-
-### NEW FUNCTION: Integrated from Task 2 ###
+# The helper functions _generate_intra_hour_arrival_minutes, _simulate_annual_demand_path,
+# and _generate_packages_for_one_day remain the same as the previous version.
 def _generate_intra_hour_arrival_minutes(N, lsp_proportion=0.8, lsp_mean=15, lsp_std=5):
     """Generates N package arrival times within a single hour."""
-    if N <= 0:
-        return []
-    n_lsp = int(round(N * lsp_proportion))
-    n_cust = N - n_lsp
+    if N <= 0: return []
+    n_lsp = int(round(N * lsp_proportion)); n_cust = N - n_lsp
     lsp_times = np.clip(np.random.normal(loc=lsp_mean, scale=lsp_std, size=n_lsp), 0, 60)
     cust_times = np.random.uniform(0, 60, n_cust)
-    all_times = np.concatenate((lsp_times, cust_times))
-    all_times.sort()
+    all_times = np.concatenate((lsp_times, cust_times)); all_times.sort()
     return list(all_times)
 
 def _simulate_annual_demand_path() -> list[int]:
     """Simulates a single 5-year demand path through the scenario tree."""
-    annual_demands = []
-    current_node = 'start'
+    annual_demands = []; current_node = 'start'
     for _ in range(5):
         next_states = SCENARIO_TREE[current_node]
-        nodes = [state[0] for state in next_states]
-        probabilities = [state[1] for state in next_states]
+        nodes, probabilities = zip(*next_states)
         chosen_node = np.random.choice(nodes, p=probabilities)
-        demand = SCENARIO_DEMANDS[chosen_node]
-        annual_demands.append(demand)
-        current_node = chosen_node
+        annual_demands.append(SCENARIO_DEMANDS[chosen_node]); current_node = chosen_node
     return annual_demands
 
-### MODIFIED SECTION: This function now uses the new intra-hour logic ###
 def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> list[dict]:
     """Generates a list of package demand instances for a single day."""
-    if num_packages <= 0:
-        return []
-        
+    if num_packages <= 0: return []
     package_list = []
-    
-    # 1. Generate package attributes that are independent of timing
     required_sizes = np.random.choice(SIZES, size=num_packages, p=SIZE_PROBS)
-    
-    # 2. Generate precise desired deposit times
     deposit_hours = np.random.choice(24, size=num_packages, p=DEPOSIT_HOUR_PROBS)
     hourly_deposit_counts = pd.Series(deposit_hours).value_counts().to_dict()
-    
     all_deposit_datetimes = []
     for hour, count in hourly_deposit_counts.items():
         arrival_minutes = _generate_intra_hour_arrival_minutes(count)
         for minute in arrival_minutes:
             base_time = datetime.datetime.combine(date, datetime.time(hour=hour))
-            precise_time = base_time + datetime.timedelta(minutes=minute)
-            all_deposit_datetimes.append(precise_time)
-            
+            all_deposit_datetimes.append(base_time + datetime.timedelta(minutes=minute))
     random.shuffle(all_deposit_datetimes)
-
-    ### START OF FIX ###
-    # 3. Generate precise desired pickup times using the same intra-hour logic
     pickup_hours = np.random.choice(24, size=num_packages, p=PICKUP_HOUR_PROBS)
     hourly_pickup_counts = pd.Series(pickup_hours).value_counts().to_dict()
-    
     all_pickup_minutes = []
     for hour, count in hourly_pickup_counts.items():
-        # Using uniform distribution for customer pickups as a simple assumption
         arrival_minutes = np.random.uniform(0, 60, count)
-        for minute in arrival_minutes:
-            # We only need the hour and minute part for now
-            all_pickup_minutes.append((hour, minute))
-
+        for minute in arrival_minutes: all_pickup_minutes.append((hour, minute))
     random.shuffle(all_pickup_minutes)
-    ### END OF FIX ###
-
-    # 4. Create the final package list
     for i in range(num_packages):
         desired_deposit_dt = all_deposit_datetimes[i]
-        
-        ### START OF FIX ###
-        # Determine desired pickup datetime with minute-precision
         pickup_hour, pickup_minute = all_pickup_minutes[i]
         pickup_date = desired_deposit_dt.date()
-        if pickup_hour < desired_deposit_dt.hour:
-            pickup_date += datetime.timedelta(days=1) 
-        
+        if pickup_hour < desired_deposit_dt.hour: pickup_date += datetime.timedelta(days=1)
         base_pickup_time = datetime.datetime.combine(pickup_date, datetime.time(hour=pickup_hour))
         desired_pickup_dt = base_pickup_time + datetime.timedelta(minutes=pickup_minute)
-        ### END OF FIX ###
-        
-        # Determine real datetimes with variability
         deposit_offset_hours = random.uniform(-1.5, 180.0)
         pickup_offset_hours = random.uniform(-6.0, 6.0)
-        
         real_deposit_dt = desired_deposit_dt + datetime.timedelta(hours=deposit_offset_hours)
-        if real_deposit_dt >= desired_pickup_dt:
-            real_deposit_dt = desired_pickup_dt - datetime.timedelta(hours=1)
-            
+        if real_deposit_dt >= desired_pickup_dt: real_deposit_dt = desired_pickup_dt - datetime.timedelta(hours=1)
         real_pickup_dt = desired_pickup_dt + datetime.timedelta(hours=pickup_offset_hours)
-        
-        package_list.append({
-            'min_size_ft3': required_sizes[i],
-            'desired_deposit_dt': desired_deposit_dt,
-            'desired_pickup_dt': desired_pickup_dt,
-            'real_deposit_dt': real_deposit_dt,
-            'real_pickup_dt': real_pickup_dt
-        })
-        
+        package_list.append({'min_size_ft3': required_sizes[i], 'desired_deposit_dt': desired_deposit_dt,
+                             'desired_pickup_dt': desired_pickup_dt, 'real_deposit_dt': real_deposit_dt,
+                             'real_pickup_dt': real_pickup_dt})
     return package_list
 
+
 # =============================================================================
-# --- Section 3: Main Simulator Function (No changes in this section) ---
+# --- Section 3: Main Simulator Function ---
 # =============================================================================
+
+### REFACTORED SECTION: This function now includes the two-level variability ###
 def generate_five_year_demand_instance() -> pd.DataFrame:
-    """Develops a locker bank demand simulator."""
-    print("--- Starting 5-Year Dynamic Demand Simulation ---")
+    """Develops a locker bank demand simulator with two-level variability."""
+    print("--- Starting 5-Year Dynamic Demand Simulation (with two-level CV) ---")
     
     annual_demands = _simulate_annual_demand_path()
-    print(f"Simulated Annual Demand Path: {annual_demands}")
+    print(f"Simulated Annual Demand Path (Mean Targets): {annual_demands}")
 
     start_date = datetime.date(START_YEAR, 1, 1)
     end_date = start_date + datetime.timedelta(days=int(5 * 365.25) - 1)
@@ -176,47 +137,64 @@ def generate_five_year_demand_instance() -> pd.DataFrame:
     all_years_dfs = []
     for year_idx, total_annual_demand in enumerate(annual_demands):
         year = START_YEAR + year_idx
-        year_df = daily_demand_df[daily_demand_df['year'] == year].copy()
+        year_df_template = daily_demand_df[daily_demand_df['year'] == year].copy()
         
-        if len(year_df) == 0: continue
-            
-        mean_daily_demand = total_annual_demand / len(year_df)
-        
-        year_df['period_share'] = year_df['period'].map(PERIOD_DEMAND_SHARE)
-        year_df['dow_share'] = year_df['day_of_week'].map(DAY_OF_WEEK_SHARE)
+        all_period_dfs = []
+        # New inner loop to simulate each period's total demand first
+        for period_num in range(1, 14):
+            period_df = year_df_template[year_df_template['period'] == period_num].copy()
+            if len(period_df) == 0: continue
 
-        avg_period_share = year_df['period_share'].mean()
-        avg_dow_share = year_df['dow_share'].mean()
-        
-        year_df['expected_demand'] = (mean_daily_demand * (year_df['period_share'] / avg_period_share) * (year_df['dow_share'] / avg_dow_share))
+            # Step 1: Simulate total demand for this period using the 0.2 CV
+            expected_period_demand = total_annual_demand * PERIOD_DEMAND_SHARE[period_num]
+            period_std_dev = expected_period_demand * PERIOD_CV
+            simulated_period_demand = np.random.normal(expected_period_demand, period_std_dev)
+            simulated_period_demand = int(max(0, round(simulated_period_demand)))
 
-        std_dev = year_df['expected_demand'] * DAILY_DEMAND_CV
-        year_df['simulated_demand'] = np.random.normal(year_df['expected_demand'], std_dev)
-        year_df['simulated_demand'] = year_df['simulated_demand'].fillna(0).round().astype(int).clip(lower=0)
+            # Step 2: Distribute this simulated period total across its days
+            if len(period_df) > 0:
+                mean_daily_for_period = simulated_period_demand / len(period_df)
+                period_df['dow_share'] = period_df['day_of_week'].map(DAY_OF_WEEK_SHARE)
+                avg_dow_share_in_period = period_df['dow_share'].mean()
+                
+                # Calculate expected demand for each day based on its DoW share
+                period_df['expected_daily'] = mean_daily_for_period * (period_df['dow_share'] / avg_dow_share_in_period)
+                
+                # Apply the 0.25 daily CV
+                daily_std_dev = period_df['expected_daily'] * DAILY_DEMAND_CV
+                period_df['simulated_daily'] = np.random.normal(period_df['expected_daily'], daily_std_dev)
+                period_df['simulated_daily'] = period_df['simulated_daily'].fillna(0).round().astype(int).clip(lower=0)
+                
+                # Rescale daily demand to perfectly match the simulated period total
+                current_sum = period_df['simulated_daily'].sum()
+                if current_sum > 0:
+                    scale_factor = simulated_period_demand / current_sum
+                    period_df['final_daily_demand'] = (period_df['simulated_daily'] * scale_factor).round().astype(int)
+                else:
+                    period_df['final_daily_demand'] = 0
+
+                remainder = simulated_period_demand - period_df['final_daily_demand'].sum()
+                if remainder > 0:
+                    demand_values = period_df['final_daily_demand'].values
+                    add_indices = np.random.choice(demand_values.size, size=int(remainder), replace=True)
+                    np.add.at(demand_values, add_indices, 1)
+                    period_df['final_daily_demand'] = demand_values
+            else:
+                 period_df['final_daily_demand'] = 0
+
+            all_period_dfs.append(period_df)
         
-        current_sum = year_df['simulated_demand'].sum()
-        if current_sum > 0:
-            scale_factor = total_annual_demand / current_sum
-            year_df['final_daily_demand'] = (year_df['simulated_demand'] * scale_factor).round().astype(int)
-        else:
-            year_df['final_daily_demand'] = 0
-        
-        remainder = total_annual_demand - year_df['final_daily_demand'].sum()
-        if remainder > 0:
-            demand_values = year_df['final_daily_demand'].values
-            add_indices = np.random.choice(demand_values.size, size=remainder, replace=True)
-            np.add.at(demand_values, add_indices, 1)
-            year_df['final_daily_demand'] = demand_values
-            
-        all_years_dfs.append(year_df)
+        if all_period_dfs:
+            year_df_final = pd.concat(all_period_dfs)
+            all_years_dfs.append(year_df_final)
 
     if not all_years_dfs: return pd.DataFrame()
-
-    daily_demand_df = pd.concat(all_years_dfs)
+    
+    final_demand_schedule = pd.concat(all_years_dfs)
     
     all_packages = []
     print("\nGenerating individual package details for each day...")
-    for _, row in tqdm(daily_demand_df.iterrows(), total=len(daily_demand_df), desc="Daily Progress"):
+    for _, row in tqdm(final_demand_schedule.iterrows(), total=len(final_demand_schedule), desc="Daily Progress"):
         num_packages_today = row['final_daily_demand']
         if num_packages_today > 0:
             packages_today = _generate_packages_for_one_day(int(num_packages_today), row['date'].date())
@@ -230,6 +208,7 @@ def generate_five_year_demand_instance() -> pd.DataFrame:
     
     return demand_instance_df
 
+
 # =============================================================================
 # --- Section 4: Execution Block (No changes in this section) ---
 # =============================================================================
@@ -238,17 +217,15 @@ if __name__ == '__main__':
     
     if not demand_df.empty:
         print("\n\n--- Simulation Output ---")
-        print(f"Successfully generated {len(demand_df):,} package demand instances over 5 years.")
-        print("\nDataFrame Info:")
+        actual_total_demand = len(demand_df)
+        print(f"Successfully generated {actual_total_demand:,} package demand instances over 5 years.")
         demand_df.info()
         print("\nSample of Generated Demand Data (First 5 rows):")
         print(demand_df.head())
-        print("\nDescriptive Statistics for Package Size:")
-        print(demand_df['min_size_ft3'].describe())
         
         output_folder = "Task_3_Outcome"
         os.makedirs(output_folder, exist_ok=True)
-        filename = "task3_demand_instance_with_intra_hour_arrivals.csv"
+        filename = "task3_demand_instance_two_level_cv.csv"
         output_filepath = os.path.join(output_folder, filename)
         
         demand_df.to_csv(output_filepath, index=False)
