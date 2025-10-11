@@ -1,0 +1,233 @@
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+import os
+
+class Locker:
+    """Represents a single locker with its attributes and schedule."""
+    def __init__(self, locker_id, size_category, position, ergonomic_score):
+        self.id = locker_id
+        self.size = size_category
+        self.position = position  # (row, col)
+        self.ergonomic_score = ergonomic_score
+        # Schedule stores tuples of (start_time, end_time)
+        self.schedule = []
+
+    def is_available(self, start, end):
+        """Checks if the locker is free during the requested time window."""
+        for booked_start, booked_end in self.schedule:
+            # Check for any overlap
+            if start < booked_end and end > booked_start:
+                return False
+        return True
+
+    def book(self, start, end):
+        """Adds a new booking to the schedule and keeps it sorted."""
+        self.schedule.append((start, end))
+        self.schedule.sort()
+
+class LockerBank:
+    """Represents the entire locker bank, including layout and ergonomic zones."""
+    def __init__(self, num_s, num_m, num_l, height=15):
+        self.lockers = []
+        self.height = height
+        self._create_layout(num_s, num_m, num_l)
+
+    def _get_ergonomic_score(self, row):
+        """Assigns a score based on the row (height)."""
+        # Prime ergonomic zone (e.g., rows 4-9)
+        if 4 <= row <= 9:
+            return 1.0  # Best
+        # Acceptable zone (e.g., rows 2-3 and 10-12)
+        elif 2 <= row <= 3 or 10 <= row <= 12:
+            return 0.5  # Okay
+        # Poor zone (bottom and top rows)
+        else:
+            return 0.1  # Worst
+
+    def _create_layout(self, num_s, num_m, num_l):
+        """Creates a simple grid layout for the lockers."""
+        size_map = {'small': 1, 'medium': 2, 'large': 3}
+        locker_specs = [('small', num_s), ('medium', num_m), ('large', num_l)]
+        
+        locker_id_counter = 0
+        current_row, current_col = 0, 0
+        
+        for size, count in locker_specs:
+            for _ in range(count):
+                if current_row + size_map[size] > self.height:
+                    current_row = 0
+                    current_col += 1
+                
+                # Assign position as the center row of the locker
+                position = (current_row + size_map[size] // 2, current_col)
+                ergo_score = self._get_ergonomic_score(position[0])
+                
+                self.lockers.append(
+                    Locker(locker_id_counter, size, position, ergo_score)
+                )
+                current_row += size_map[size]
+                locker_id_counter += 1
+
+class AssignmentAgent:
+    """Processes demand requests and assigns them using a specified heuristic."""
+    def __init__(self, locker_bank, demand_df):
+        self.locker_bank = locker_bank
+        self.demand_df = demand_df.sort_values(by='real_deposit_dt').reset_index(drop=True)
+        self.size_map = {'small': 1, 'medium': 2, 'large': 3}
+        self.size_req_map = self._create_size_req_map()
+
+    def _create_size_req_map(self):
+        """Maps ft³ requirements to size categories."""
+        size_map = {}
+        for size in range(1, 4): size_map[size] = 'small'
+        for size in range(4, 10): size_map[size] = 'medium'
+        for size in range(10, 19): size_map[size] = 'large'
+        return size_map
+
+    def _get_candidate_lockers(self, req_size_category):
+        """Finds all lockers that can fit the package."""
+        req_size_val = self.size_map[req_size_category]
+        candidates = []
+        for locker in self.locker_bank.lockers:
+            if self.size_map[locker.size] >= req_size_val:
+                candidates.append(locker)
+        return candidates
+
+    def run_simulation(self, heuristic='strawman'):
+        """Runs the entire simulation for the demand list using a heuristic."""
+        results = []
+        for _, request in tqdm(self.demand_df.iterrows(), total=len(self.demand_df), desc=f"Simulating with {heuristic}"):
+            req_size_cat = self.size_req_map[request['min_size_ft3']]
+            start_time = request['real_deposit_dt']
+            end_time = request['real_pickup_dt']
+            
+            if heuristic == 'strawman':
+                assignment = self._strawman_assign(req_size_cat, start_time, end_time)
+            elif heuristic == 'smarter':
+                assignment = self._smarter_assign(req_size_cat, start_time, end_time)
+            else:
+                raise ValueError("Unknown heuristic")
+
+            result_row = {
+                'package_id': request['package_id'],
+                'status': 'rejected',
+                'assigned_locker_id': None,
+                'assigned_locker_size': None,
+                'required_size': req_size_cat
+            }
+            if assignment:
+                assignment.book(start_time, end_time)
+                result_row.update({
+                    'status': 'accepted',
+                    'assigned_locker_id': assignment.id,
+                    'assigned_locker_size': assignment.size
+                })
+            results.append(result_row)
+        
+        return pd.DataFrame(results)
+
+    def _strawman_assign(self, req_size_cat, start, end):
+        """Heuristic a: Simple, myopic, first-fit assignment."""
+        candidates = self._get_candidate_lockers(req_size_cat)
+        for locker in candidates:
+            if locker.is_available(start, end):
+                return locker # Assign to the first one found
+        return None
+
+    def _smarter_assign(self, req_size_cat, start, end):
+        """Heuristic b: Scoring-based assignment considering multiple factors."""
+        candidates = self._get_candidate_lockers(req_size_cat)
+        available_lockers = [l for l in candidates if l.is_available(start, end)]
+
+        if not available_lockers:
+            return None
+
+        best_locker = None
+        max_score = -1
+
+        for locker in available_lockers:
+            # 1. Size Fit Score (40% weight)
+            size_diff = self.size_map[locker.size] - self.size_map[req_size_cat]
+            size_score = 1.0 / (1 + size_diff * 2) # Heavily penalize oversizing
+
+            # 2. Ergonomics Score (35% weight)
+            ergo_score = locker.ergonomic_score
+
+            # 3. Future Impact Score (25% weight)
+            # Measures time until the next booking. Longer is better.
+            next_booking_start = float('inf')
+            for s, e in locker.schedule:
+                if s >= end:
+                    next_booking_start = s
+                    break
+            
+            if next_booking_start == float('inf'):
+                future_score = 1.0 # No future bookings, ideal
+            else:
+                # Normalize by a 30-day window
+                time_gap_hours = (next_booking_start - end).total_seconds() / 3600
+                future_score = min(1.0, time_gap_hours / (24 * 30))
+
+            # Weighted final score
+            total_score = (0.40 * size_score) + (0.35 * ergo_score) + (0.25 * future_score)
+
+            if total_score > max_score:
+                max_score = total_score
+                best_locker = locker
+        
+        return best_locker
+
+# --- Main Execution ---
+if __name__ == '__main__':
+    # --- 1. Setup ---
+    # Define a baseline locker bank configuration (you can adjust this)
+    NUM_SMALL = 140
+    NUM_MEDIUM = 164
+    NUM_LARGE = 96
+    TOTAL_LOCKERS = NUM_SMALL + NUM_MEDIUM + NUM_LARGE
+    
+    # Create the output directory
+    output_folder = "Task_4_Outcome"
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # Load demand data from Task 3
+    try:
+        demand_file = "Task_3_Outcome/task3_demand_instance_two_level_cv.csv"
+        demand_df = pd.read_csv(demand_file, parse_dates=['real_deposit_dt', 'real_pickup_dt'])
+        # For demonstration, use a smaller sample of the first year's demand
+        demand_df = demand_df[demand_df['real_deposit_dt'] < '2027-01-01'].head(20000)
+    except FileNotFoundError:
+        print(f"Error: Demand file not found at '{demand_file}'")
+        print("Please run the Task 3 script first to generate the demand data.")
+        exit()
+        
+    # --- 2. Run Strawman Simulation ---
+    locker_bank_strawman = LockerBank(NUM_SMALL, NUM_MEDIUM, NUM_LARGE)
+    agent_strawman = AssignmentAgent(locker_bank_strawman, demand_df)
+    results_strawman = agent_strawman.run_simulation(heuristic='strawman')
+    
+    # Save results
+    strawman_path = os.path.join(output_folder, "strawman_assignment_results.csv")
+    results_strawman.to_csv(strawman_path, index=False)
+    
+    # --- 3. Run Smarter Simulation ---
+    # We need a new LockerBank instance to reset the schedules
+    locker_bank_smarter = LockerBank(NUM_SMALL, NUM_MEDIUM, NUM_LARGE)
+    agent_smarter = AssignmentAgent(locker_bank_smarter, demand_df)
+    results_smarter = agent_smarter.run_simulation(heuristic='smarter')
+
+    # Save results
+    smarter_path = os.path.join(output_folder, "smarter_assignment_results.csv")
+    results_smarter.to_csv(smarter_path, index=False)
+    
+    # --- 4. Compare and Report ---
+    print("\n--- Simulation Complete: Performance Comparison ---")
+    
+    strawman_sl = results_strawman['status'].value_counts(normalize=True).get('accepted', 0)
+    smarter_sl = results_smarter['status'].value_counts(normalize=True).get('accepted', 0)
+    
+    print(f"Strawman Heuristic Service Level: {strawman_sl:.2%}")
+    print(f"Smarter Heuristic Service Level:  {smarter_sl:.2%}")
+    
+    print(f"\n✅ Detailed results saved in the '{output_folder}' directory.")
