@@ -1,0 +1,273 @@
+# -*- coding: utf-8 -*-
+"""
+Task 6 - Dynamic Performance Assessment of the Baseline Design (FULL 5-YEAR SIMULATION)
+Author: (your name)
+Last Update: 2025-10-11
+
+功能：
+- 使用完整的五年需求数据，对 Task 1 的基准储物柜设计进行全面的动态性能评估。
+- 分别运行 Strawman 和 Smarter 两种策略，并对比其在整个生命周期内的表现。
+"""
+
+import os
+import json
+import math
+import warnings
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from collections import defaultdict
+
+# ==================================
+# --- 任务6：实验控制参数 ---
+# ==================================
+### MODIFIED: Set to 1 as we are running the full, deterministic 5-year dataset ###
+REPLICATIONS = 1
+
+# 根据 Task 1 的基准设计信息
+BASELINE_NUM_SMALL = 60
+BASELINE_NUM_MEDIUM = 71
+BASELINE_NUM_LARGE = 41
+
+# --- 以下为从 Task 5 迁移过来的核心代码 ---
+warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
+OUT_DIR = "Task_6_Outcome"
+os.makedirs(OUT_DIR, exist_ok=True)
+RANDOM_SEED_BASE = 20251010
+
+INPUT_DEMAND_CSV = "Task_3_Outcome/task3_demand_instance_two_level_cv.csv"
+GRID_HEIGHT = 15; ROW_HEIGHT_CM = 10; BASE_FLOOR_TO_ROW0_CM = 30
+SIZE_UNITS = {'small': 1, 'medium': 2, 'large': 3}
+USER_HEIGHT_DIST_CM = {'p05': 153, 'p50': 161, 'p95': 172}
+ARM_REACH_OFFSET_CM = 70; REACH_SAFETY_MARGIN_CM = 10
+POLICY_EARLY_ARRIVE_MAX_MIN = 90; POLICY_LATE_PICKUP_MAX_H = 180
+BASE_FEE = 5.0; SIZE_UPCHARGE = {'small': 0.0, 'medium': 1.5, 'large': 3.0}
+LATE_FEE_STEP = 0.20
+LOOKAHEAD_HOURS = 48; SIZE_PROTECTION_LARGE_THRESHOLD = 0.15
+SLA_DAILY_TARGET = 0.995
+WARMUP_DAYS = 2.0
+
+# --- 工具函数, 数据结构, Agent, Simulator (与之前版本相同) ---
+def row_to_height_cm(row_idx: int) -> float: return BASE_FLOOR_TO_ROW0_CM + row_idx * ROW_HEIGHT_CM
+def sample_user_height_cm() -> float:
+    r = np.random.rand()
+    if r < 0.2: return np.random.normal(USER_HEIGHT_DIST_CM['p05'], 2.5)
+    elif r < 0.8: return np.random.normal(USER_HEIGHT_DIST_CM['p50'], 3.0)
+    else: return np.random.normal(USER_HEIGHT_DIST_CM['p95'], 2.5)
+def reachable_row_range_for_user() -> tuple[int, int]:
+    h = sample_user_height_cm()
+    reach_max_cm = h + ARM_REACH_OFFSET_CM - REACH_SAFETY_MARGIN_CM
+    reach_min_cm = max(0, h * 0.35)
+    max_row = min(GRID_HEIGHT - 1, int(round((reach_max_cm - BASE_FLOOR_TO_ROW0_CM) / ROW_HEIGHT_CM)))
+    min_row = max(0, int(round((reach_min_cm - BASE_FLOOR_TO_ROW0_CM) / ROW_HEIGHT_CM)))
+    return (min_row, max_row) if min_row <= max_row else (0, GRID_HEIGHT - 1)
+def ceil_int(x): return int(math.ceil(float(x)))
+def ensure_int_ft3(val, lo=1, hi=18):
+    if pd.isna(val): return lo
+    return max(lo, min(hi, ceil_int(val)))
+class Locker:
+    def __init__(self, locker_id, size_category, position_rc):
+        self.id = locker_id; self.size = size_category; self.position = position_rc; self.schedule = []
+    def is_available(self, start, end):
+        for s, e in self.schedule:
+            if start < e and end > s: return False
+        return True
+    def book(self, start, end):
+        self.schedule.append((start, end)); self.schedule.sort(key=lambda x: x[0])
+class LockerBank:
+    def __init__(self, num_s, num_m, num_l, height=GRID_HEIGHT):
+        self.height = height; self.lockers = []
+        self._create_layout(num_s, num_m, num_l)
+    def _create_layout(self, num_s, num_m, num_l):
+        specs = [('small', num_s), ('medium', num_m), ('large', num_l)]
+        current_row, current_col, lid = 0, 0, 0
+        for size, cnt in specs:
+            h_units = SIZE_UNITS[size]
+            for _ in range(cnt):
+                if current_row + h_units > self.height: current_row, current_col = 0, current_col + 1
+                center_row = current_row + (h_units // 2)
+                self.lockers.append(Locker(lid, size, (center_row, current_col)))
+                current_row += h_units; lid += 1
+    def total_lockers(self): return len(self.lockers)
+class AssignmentAgent:
+    def __init__(self, locker_bank: LockerBank):
+        self.lb = locker_bank; self.req_size_map = self._build_req_size_map()
+        self.base_fee = BASE_FEE; self.size_upcharge = SIZE_UPCHARGE
+        self.total_large = sum(1 for L in self.lb.lockers if L.size == 'large')
+    @staticmethod
+    def _build_req_size_map():
+        m = {}; [m.update({s: 'small'}) for s in range(1, 4)]; [m.update({s: 'medium'}) for s in range(4, 10)]; [m.update({s: 'large'}) for s in range(10, 19)]
+        return m
+    @staticmethod
+    def _size_value(cat): return SIZE_UNITS[cat]
+    def _user_reachable(self, locker: Locker, reachable_range): rmin, rmax = reachable_range; return rmin <= locker.position[0] <= rmax
+    def _get_candidates(self, req_cat, reachable_range):
+        req_v = self._size_value(req_cat)
+        feas = [L for L in self.lb.lockers if self._size_value(L.size) >= req_v and self._user_reachable(L, reachable_range)]
+        feas.sort(key=lambda L: (self._size_value(L.size) - req_v, L.position[1], abs(L.position[0] - GRID_HEIGHT//2)))
+        return feas
+    def _large_remaining_ratio(self):
+        used_large = sum(1 for L in self.lb.lockers if L.size=='large' and len(L.schedule)>0)
+        return max(0, self.total_large - used_large) / max(1, self.total_large)
+    def _smarter_score(self, locker: Locker, req_cat, start, end):
+        req_v = self._size_value(req_cat); size_diff = self._size_value(locker.size) - req_v
+        size_score = 1.0 / (1 + 2.0 * max(0, size_diff))
+        ergo_soft = 1.0 - min(1.0, abs(locker.position[0] - GRID_HEIGHT/2) / (GRID_HEIGHT/2)) * 0.6
+        next_start = float('inf')
+        for s, e in locker.schedule:
+            if s >= end: next_start = s; break
+        future = 1.0 if next_start == float('inf') else max(0.0, min(1.0, (next_start - end).total_seconds()/3600 / LOOKAHEAD_HOURS))
+        protect_penalty = 0.0
+        if locker.size == 'large' and size_diff > 0:
+            remain_ratio = self._large_remaining_ratio()
+            if remain_ratio < SIZE_PROTECTION_LARGE_THRESHOLD: protect_penalty = (SIZE_PROTECTION_LARGE_THRESHOLD - remain_ratio) * 0.8
+        return (0.40 * size_score) + (0.30 * ergo_soft) + (0.30 * future) - protect_penalty
+    def _apply_policy_and_price(self, desired_start, desired_end, assigned_size, req_size):
+        rs = max(desired_start - pd.Timedelta(minutes=POLICY_EARLY_ARRIVE_MAX_MIN), desired_start.floor('h'))
+        re = min(desired_end + pd.Timedelta(hours=POLICY_LATE_PICKUP_MAX_H), desired_end.ceil('h'))
+        base, upc = self.base_fee, self.size_upcharge.get(assigned_size, 0.0)
+        planned, actual = (desired_end - desired_start).total_seconds(), (re - rs).total_seconds()
+        late_fee = 0.0
+        if planned > 0 and actual > planned: late_fee = int(math.ceil((actual - planned)/planned / LATE_FEE_STEP)) * LATE_FEE_STEP * base
+        return rs, re, base, upc, late_fee
+    def assign_strawman(self, req_cat, start, end, rr):
+        for L in self._get_candidates(req_cat, rr):
+            if L.is_available(start, end): return L
+        return None
+    def assign_smarter(self, req_cat, start, end, rr):
+        cands = [L for L in self._get_candidates(req_cat, rr) if L.is_available(start, end)]
+        if not cands: return None
+        return max(cands, key=lambda L: self._smarter_score(L, req_cat, start, end))
+class LockerBankSimulator:
+    def __init__(self, locker_bank: LockerBank, demand_df: pd.DataFrame, agent: AssignmentAgent, heuristic='smarter', warmup_days=WARMUP_DAYS):
+        self.lb = locker_bank; self.demand = demand_df.copy(); self.agent = agent; self.heuristic = heuristic
+        self.warmup_days = warmup_days; self.results = pd.DataFrame()
+    def _req_category(self, v_ft3):
+        v = ensure_int_ft3(v_ft3)
+        if 1 <= v <= 3: return 'small'
+        elif 4 <= v <= 9: return 'medium'
+        else: return 'large'
+    def run(self):
+        if self.demand.empty: return
+        start_ts = self.demand['real_deposit_dt'].min(); warmup_cut = start_ts + pd.Timedelta(days=self.warmup_days)
+        rows = []
+        for _, r in tqdm(self.demand.iterrows(), total=len(self.demand), desc=f"Simulating {self.heuristic} (5 years)"):
+            req_cat = self._req_category(r['min_size_ft3']); start, end = pd.to_datetime(r['real_deposit_dt']), pd.to_datetime(r['real_pickup_dt'])
+            rr = reachable_row_range_for_user()
+            chosen = self.agent.assign_strawman(req_cat, start, end, rr) if self.heuristic == 'strawman' else self.agent.assign_smarter(req_cat, start, end, rr)
+            row = {'package_id': r['package_id'], 'required_size': req_cat, 'status': 'rejected', 'reason': '', 'desired_start': start, 'desired_end': end,
+                   'date': start.date(), 'keep_for_eval': start >= warmup_cut}
+            if chosen is None:
+                row['reason'] = 'rejected_full' if len(self.agent._get_candidates(req_cat, rr)) > 0 else 'rejected_unreachable'
+            else:
+                rs, re, base, upc, late = self.agent._apply_policy_and_price(start, end, chosen.size, req_cat)
+                chosen.book(rs, re)
+                row.update({'status': 'accepted', 'reason': 'accepted_exact' if chosen.size == req_cat else 'accepted_oversize',
+                            'assigned_locker_id': chosen.id, 'assigned_locker_size': chosen.size, 'real_start': rs, 'real_end': re,
+                            'revenue_base': base, 'revenue_size_upcharge': upc, 'revenue_late_fee': late})
+            rows.append(row)
+        self.results = pd.DataFrame(rows)
+    def summarize(self):
+        if self.results.empty: return None
+        eval_df = self.results[self.results['keep_for_eval']].copy()
+        if eval_df.empty: return {'overall_sl': 0, 'min_daily_sla': 0, 'breach_days': 0, 'total_revenue': 0}
+        daily = eval_df.groupby('date').agg(reqs=('package_id','count'), acc=('status', lambda s: (s=='accepted').sum())).reset_index()
+        daily['service_level'] = daily['acc'] / daily['reqs']
+        rev = eval_df[['revenue_base','revenue_size_upcharge','revenue_late_fee']].sum()
+        return {'overall_sl': (eval_df['status']=='accepted').mean(), 'min_daily_sla': daily['service_level'].min(),
+                'breach_days': int((daily['service_level'] < SLA_DAILY_TARGET).sum()), 'total_revenue': float(rev.sum())}
+def plot_full_timeseries(df_daily_a, df_daily_b, metric_col, title, out_path):
+    plt.figure(figsize=(15, 6))
+    plt.plot(pd.to_datetime(df_daily_a['date']), df_daily_a[metric_col], label='Strawman', alpha=0.8)
+    plt.plot(pd.to_datetime(df_daily_b['date']), df_daily_b[metric_col], label='Smarter', alpha=0.8)
+    if 'service_level' in metric_col:
+        plt.axhline(SLA_DAILY_TARGET, color='r', linestyle='--', label=f'{SLA_DAILY_TARGET*100}% Target')
+    plt.title(title, fontsize=16)
+    plt.xlabel('Date', fontsize=12)
+    plt.ylabel(metric_col.replace('_', ' ').title(), fontsize=12)
+    plt.legend()
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+# =========================
+# 主程序
+# =========================
+def main():
+    print("--- Task 6: Starting Full 5-Year Dynamic Performance Assessment ---")
+    print(f"Using Baseline Configuration: Small={BASELINE_NUM_SMALL}, Medium={BASELINE_NUM_MEDIUM}, Large={BASELINE_NUM_LARGE}")
+    
+    if not os.path.exists(INPUT_DEMAND_CSV):
+        raise FileNotFoundError(f"Input demand file not found: {INPUT_DEMAND_CSV}\nPlease run Task 3 script first.")
+
+    # --- MODIFICATION: Load the full 5-year dataset ---
+    demand_df = pd.read_csv(INPUT_DEMAND_CSV, parse_dates=['real_deposit_dt','real_pickup_dt'])
+    demand_df.sort_values(by='real_deposit_dt', inplace=True)
+    print(f"\nLoaded full 5-year demand data with {len(demand_df):,} records.")
+
+    # --- 运行 Strawman ---
+    print("\n--- Running Simulation for 'Strawman' Heuristic ---")
+    bank_a = LockerBank(BASELINE_NUM_SMALL, BASELINE_NUM_MEDIUM, BASELINE_NUM_LARGE)
+    agent_a = AssignmentAgent(bank_a)
+    sim_a = LockerBankSimulator(bank_a, demand_df, agent_a, heuristic='strawman')
+    sim_a.run()
+    
+    # --- 运行 Smarter ---
+    print("\n--- Running Simulation for 'Smarter' Heuristic ---")
+    bank_b = LockerBank(BASELINE_NUM_SMALL, BASELINE_NUM_MEDIUM, BASELINE_NUM_LARGE)
+    agent_b = AssignmentAgent(bank_b)
+    sim_b = LockerBankSimulator(bank_b, demand_df, agent_b, heuristic='smarter')
+    sim_b.run()
+
+    # --- 聚合、分析与输出 ---
+    print("\n--- Aggregating and Analyzing Results ---")
+    summary_a = sim_a.summarize()
+    summary_b = sim_b.summarize()
+    
+    # 获取每日数据用于绘图
+    res_a_eval = sim_a.results[sim_a.results['keep_for_eval']].copy()
+    daily_a = res_a_eval.groupby('date').agg(reqs=('package_id','count'), acc=('status', lambda s: (s=='accepted').sum())).reset_index()
+    daily_a['service_level'] = daily_a['acc'] / daily_a['reqs']
+
+    res_b_eval = sim_b.results[sim_b.results['keep_for_eval']].copy()
+    daily_b = res_b_eval.groupby('date').agg(reqs=('package_id','count'), acc=('status', lambda s: (s=='accepted').sum())).reset_index()
+    daily_b['service_level'] = daily_b['acc'] / daily_b['reqs']
+    
+    summary_data = {
+        'Heuristic': ['Strawman', 'Smarter'],
+        'Overall Service Level': [summary_a['overall_sl'], summary_b['overall_sl']],
+        'Min Daily Service Level': [summary_a['min_daily_sla'], summary_b['min_daily_sla']],
+        'SLA Breach Days': [summary_a['breach_days'], summary_b['breach_days']],
+        'Total Revenue': [summary_a['total_revenue'], summary_b['total_revenue']]
+    }
+    summary_df = pd.DataFrame(summary_data).set_index('Heuristic')
+    
+    print("\n--- Final Performance Summary (Full 5-Year Period) ---")
+    print(summary_df.round(4))
+    summary_df.to_csv(os.path.join(OUT_DIR, 'summary_5year_performance.csv'))
+    
+    print("\nGenerating comparison plots...")
+    plot_full_timeseries(daily_a, daily_b, 'service_level', '5-Year Daily Service Level Comparison', 
+                         os.path.join(OUT_DIR, 'timeseries_daily_service_level.png'))
+    
+    # 保存详细结果
+    sim_a.results.to_csv(os.path.join(OUT_DIR, 'A_strawman_full_results.csv'), index=False)
+    sim_b.results.to_csv(os.path.join(OUT_DIR, 'B_smarter_full_results.csv'), index=False)
+
+    with open(os.path.join(OUT_DIR, 'README_Task6.txt'), 'w', encoding='utf-8') as f:
+        f.write(
+            "Task 6: Dynamic Performance Assessment of the Baseline Design (FULL 5-YEAR RUN)\n\n"
+            f"This assessment was performed on the complete 5-year simulated demand data.\n"
+            f"The baseline configuration used was: Small={BASELINE_NUM_SMALL}, Medium={BASELINE_NUM_MEDIUM}, Large={BASELINE_NUM_LARGE}.\n\n"
+            "OUTPUT FILES:\n"
+            "- summary_5year_performance.csv: Final KPI comparison for both heuristics.\n"
+            "- A_strawman_full_results.csv: Detailed results for every package using the Strawman heuristic.\n"
+            "- B_smarter_full_results.csv: Detailed results for every package using the Smarter heuristic.\n"
+            "- timeseries_daily_service_level.png: A plot showing the daily service level for both heuristics over the entire 5-year period.\n"
+        )
+    print(f"\n✅ All assessment results have been saved to the '{OUT_DIR}' directory.")
+
+if __name__ == '__main__':
+    main()
