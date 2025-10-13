@@ -4,16 +4,13 @@ import datetime
 import random
 from tqdm import tqdm
 import os
-import math # 导入 math 库
+import matplotlib.pyplot as plt
 
 # =============================================================================
-# --- Section 1: Constants from Casework Document ---
+# --- Section 1: Constants from Casework Document (No changes) ---
 # =============================================================================
-
-# (Constants remain mostly the same)
 PERIOD_CV = 0.2
 DAILY_DEMAND_CV = 0.25
-
 SIZE_PROBABILITY = {
     1: 0.08, 2: 0.12, 3: 0.15, 4: 0.12, 5: 0.08, 6: 0.06, 7: 0.05,
     8: 0.05, 9: 0.05, 10: 0.04, 11: 0.04, 12: 0.03, 13: 0.03,
@@ -49,9 +46,11 @@ DAILY_PICKUP_DIST = np.array([103, 22, 38, 28, 141, 280, 547, 710, 521, 424, 506
 PICKUP_HOUR_PROBS = DAILY_PICKUP_DIST / DAILY_PICKUP_DIST.sum()
 START_YEAR = 2026
 
+
 # =============================================================================
-# --- Section 2: Helper Functions (No changes in this section) ---
+# --- Section 2: Helper Functions ---
 # =============================================================================
+
 def _generate_intra_hour_arrival_minutes(N, lsp_proportion=0.8, lsp_mean=15, lsp_std=5):
     if N <= 0: return []
     n_lsp = int(round(N * lsp_proportion)); n_cust = N - n_lsp
@@ -60,13 +59,34 @@ def _generate_intra_hour_arrival_minutes(N, lsp_proportion=0.8, lsp_mean=15, lsp
     all_times = np.concatenate((lsp_times, cust_times)); all_times.sort()
     return list(all_times)
 
-def _simulate_annual_demand_path() -> list[int]:
-    annual_demands = []; current_node = 'start'
+### MODIFIED FUNCTION ###
+def _simulate_annual_demand_path(mode='random') -> list[int]:
+    """
+    Simulates a 5-year demand path through the scenario tree.
+    
+    Args:
+        mode (str): 'random' for a probabilistic path, 
+                    'highest' for a deterministic path that always chooses the highest demand option.
+    
+    Returns:
+        list[int]: A list of 5 annual demand values.
+    """
+    annual_demands = []
+    current_node = 'start'
     for _ in range(5):
         next_states = SCENARIO_TREE[current_node]
         nodes, probabilities = zip(*next_states)
-        chosen_node = np.random.choice(nodes, p=probabilities)
-        annual_demands.append(SCENARIO_DEMANDS[chosen_node]); current_node = chosen_node
+        
+        if mode == 'highest':
+            # Deterministic: Find the next node that has the maximum possible demand value
+            chosen_node = max(nodes, key=lambda node: SCENARIO_DEMANDS[node])
+        else: # Default to 'random'
+            # Probabilistic: Choose the next node based on given probabilities
+            chosen_node = np.random.choice(nodes, p=probabilities)
+            
+        annual_demands.append(SCENARIO_DEMANDS[chosen_node])
+        current_node = chosen_node
+        
     return annual_demands
 
 def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> list[dict]:
@@ -111,17 +131,19 @@ def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> li
 # --- Section 3: Main Simulator Function ---
 # =============================================================================
 
-### MODIFIED: Function now returns two DataFrames ###
-def generate_five_year_demand_instance() -> tuple[pd.DataFrame, pd.DataFrame]:
+### MODIFIED FUNCTION ###
+def generate_five_year_demand_instance(simulation_mode: str = 'random') -> pd.DataFrame:
     """
-    Develops a locker bank demand simulator with two-level variability.
-    Returns a tuple containing:
-    1. The detailed DataFrame of every single package.
-    2. A summary DataFrame of the final simulated demand for each day.
-    """
-    print("--- Starting 5-Year Dynamic Demand Simulation (with two-level CV) ---")
+    Develops a locker bank demand simulator.
     
-    annual_demands = _simulate_annual_demand_path()
+    Args:
+        simulation_mode (str): Passed to _simulate_annual_demand_path. 
+                               Can be 'random' or 'highest'.
+    """
+    print(f"--- Starting 5-Year Dynamic Demand Simulation (Mode: {simulation_mode.upper()}) ---")
+    
+    # This now calls the modified function with the specified mode
+    annual_demands = _simulate_annual_demand_path(mode=simulation_mode)
     print(f"Simulated Annual Demand Path (Mean Targets): {annual_demands}")
 
     start_date = datetime.date(START_YEAR, 1, 1)
@@ -182,7 +204,7 @@ def generate_five_year_demand_instance() -> tuple[pd.DataFrame, pd.DataFrame]:
             year_df_final = pd.concat(all_period_dfs)
             all_years_dfs.append(year_df_final)
 
-    if not all_years_dfs: return pd.DataFrame(), pd.DataFrame()
+    if not all_years_dfs: return pd.DataFrame()
     
     final_demand_schedule = pd.concat(all_years_dfs)
     
@@ -200,49 +222,70 @@ def generate_five_year_demand_instance() -> tuple[pd.DataFrame, pd.DataFrame]:
     if not demand_instance_df.empty:
         demand_instance_df.insert(0, 'package_id', range(1, len(demand_instance_df) + 1))
     
-    return demand_instance_df, final_demand_schedule
+    return demand_instance_df
 
 
 # =============================================================================
 # --- Section 4: Execution Block ---
 # =============================================================================
 if __name__ == '__main__':
-    ### MODIFIED: The function now returns two DataFrames ###
-    demand_df, daily_summary_df = generate_five_year_demand_instance()
+    ### CHOOSE YOUR SIMULATION MODE HERE ###
+    # 'random':  A different probabilistic path each time you run.
+    # 'highest': A deterministic high-demand path for stress testing.
+    SIMULATION_MODE = 'highest' 
+    
+    demand_df = generate_five_year_demand_instance(simulation_mode=SIMULATION_MODE)
     
     output_folder = "Task_3_Outcome"
     os.makedirs(output_folder, exist_ok=True)
-    
-    # --- Save the main, detailed package list (original file) ---
+
     if not demand_df.empty:
         print("\n\n--- Simulation Output ---")
         actual_total_demand = len(demand_df)
         print(f"Successfully generated {actual_total_demand:,} package demand instances over 5 years.")
+        demand_df.info()
+        print("\nSample of Generated Demand Data (First 5 rows):")
+        print(demand_df.head())
         
-        filename_main = "task3_demand_instance_two_level_cv.csv"
-        filepath_main = os.path.join(output_folder, filename_main)
-        demand_df.to_csv(filepath_main, index=False)
-        print(f"\n✅ Full demand instance saved to '{filepath_main}'")
+        # Modify filename to reflect the simulation mode
+        filename = f"task3_demand_instance_{SIMULATION_MODE}_mode.csv"
+        output_filepath = os.path.join(output_folder, filename)
+        
+        demand_df.to_csv(output_filepath, index=False)
+        print(f"\n✅ Full demand instance saved to '{output_filepath}'")
+
+        # ================================
+        # --- Section 4.1: Visualizations ---
+        # ================================
+        figs_dir = os.path.join(output_folder, f"figs_{SIMULATION_MODE}_mode")
+        os.makedirs(figs_dir, exist_ok=True)
+        
+        # Helper transforms
+        demand_df["sojourn_hours"] = (pd.to_datetime(demand_df["real_pickup_dt"]) - pd.to_datetime(demand_df["real_deposit_dt"])).dt.total_seconds() / 3600.0
+        for col in ["desired_deposit_dt", "desired_pickup_dt", "real_deposit_dt", "real_pickup_dt"]:
+            demand_df[col] = pd.to_datetime(demand_df[col])
+        demand_df["real_deposit_date"] = demand_df["real_deposit_dt"].dt.date
+        daily_counts = demand_df.groupby("real_deposit_date", as_index=False).size()
+        daily_counts.rename(columns={"size": "num_packages"}, inplace=True)
+        daily_counts["date"] = pd.to_datetime(daily_counts["real_deposit_date"])
+        daily_counts = daily_counts.sort_values("date")
+        daily_counts["roll28"] = daily_counts["num_packages"].rolling(28, min_periods=1).mean()
+
+        # Fig 6: Daily demand time series
+        plt.figure(figsize=(12, 6))
+        plt.plot(daily_counts["date"], daily_counts["num_packages"], linewidth=1, alpha=0.7, label="Daily Packages")
+        plt.plot(daily_counts["date"], daily_counts["roll28"], linewidth=2, color='red', label="28-Day Rolling Mean")
+        plt.title(f"Daily Packages (Real Deposit Date) - Mode: {SIMULATION_MODE.upper()}")
+        plt.xlabel("Date")
+        plt.ylabel("Packages per Day")
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.6)
+        fig_path = os.path.join(figs_dir, "06_daily_counts_roll28.png")
+        plt.tight_layout()
+        plt.savefig(fig_path, dpi=150)
+        plt.show()
+        print(f"Saved: {fig_path}")
+
+        print(f"\n✅ Figures for this run saved under: {figs_dir}")
     else:
         print("\n--- Simulation resulted in an empty demand set. ---")
-
-    # --- NEW: Save the daily and annual demand summary files ---
-    if not daily_summary_df.empty:
-        # 1. Save the daily demand file
-        daily_cols_to_save = ['date', 'year', 'period', 'day_of_week', 'final_daily_demand']
-        filename_daily = "simulated_daily_demand.csv"
-        filepath_daily = os.path.join(output_folder, filename_daily)
-        daily_summary_df[daily_cols_to_save].to_csv(filepath_daily, index=False)
-        print(f"✅ Daily demand summary saved to '{filepath_daily}'")
-
-        # 2. Calculate and save the annual demand file
-        annual_summary_df = daily_summary_df.groupby('year')['final_daily_demand'].sum().reset_index()
-        annual_summary_df.rename(columns={'final_daily_demand': 'total_annual_demand'}, inplace=True)
-        
-        filename_annual = "simulated_annual_demand.csv"
-        filepath_annual = os.path.join(output_folder, filename_annual)
-        annual_summary_df.to_csv(filepath_annual, index=False)
-        print(f"✅ Annual demand summary saved to '{filepath_annual}'")
-        
-        print("\n--- Annual Demand Summary ---")
-        print(annual_summary_df)
