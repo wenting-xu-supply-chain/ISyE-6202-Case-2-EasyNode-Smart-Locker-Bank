@@ -55,14 +55,14 @@ RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
 # ——输入/输出——
-INPUT_DEMAND_CSV = "Task_3_Outcome/task3_demand_instance_two_level_cv.csv"
+INPUT_DEMAND_CSV = "Task_3_Outcome/task3_demand_instance_highest_mode.csv"
 OUTPUT_DIR = "Task_4_Outcome"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ——基线柜体配置（可调整/可从 Task 1 计算结果读取）——
-NUM_SMALL = 140
-NUM_MEDIUM = 164
-NUM_LARGE = 96
+NUM_SMALL = 40
+NUM_MEDIUM = 71
+NUM_LARGE = 41
 
 
 # =========================
@@ -317,19 +317,23 @@ class AssignmentAgent:
         for _, r in tqdm(self.df.iterrows(), total=len(self.df), desc=f"Simulating ({heuristic})", ncols=90):
             pkg = r['package_id']
             req_cat = self._req_category(r['min_size_ft3'])
-            desired_start = pd.to_datetime(r['real_deposit_dt'])
-            desired_end   = pd.to_datetime(r['real_pickup_dt'])
 
-            # 人体工学可达性（每个包裹抽样一个用户画像）
+            # ✅ 1) 直接使用 Task 3 的真实时间
+            start = pd.to_datetime(r['real_deposit_dt'])
+            end   = pd.to_datetime(r['real_pickup_dt'])
+
+            # 人体工学可达性
             reach_range = reachable_row_range_for_user()
 
+            # 选择启发式
             if heuristic == 'strawman':
-                chosen = self._assign_strawman(req_cat, desired_start, desired_end, reach_range)
+                chosen = self._assign_strawman(req_cat, start, end, reach_range)
             elif heuristic == 'smarter':
-                chosen = self._assign_smarter(req_cat, desired_start, desired_end, reach_range)
+                chosen = self._assign_smarter(req_cat, start, end, reach_range)
             else:
                 raise ValueError("Unknown heuristic")
 
+            # 统一的结果骨架（注意：不再区分 desired_*）
             result = {
                 'package_id': pkg,
                 'required_size': req_cat,
@@ -337,8 +341,6 @@ class AssignmentAgent:
                 'reason': '',
                 'assigned_locker_id': None,
                 'assigned_locker_size': None,
-                'desired_start': desired_start,
-                'desired_end': desired_end,
                 'real_start': pd.NaT,
                 'real_end': pd.NaT,
                 'revenue_base': 0.0,
@@ -347,33 +349,34 @@ class AssignmentAgent:
             }
 
             if chosen is None:
-                # 判断拒绝原因（不可达 or 满）
-                # 简化：若可达候选存在但均冲突 -> full；否则 -> unreachable
                 feas_any = len(self._get_candidates(req_cat, reach_range)) > 0
                 result['reason'] = 'rejected_full' if feas_any else 'rejected_unreachable'
             else:
-                # 应用政策（边界、差价、滞纳费），并上锁
-                real_start, real_end, base, upc, late = self._apply_policy(desired_start, desired_end, chosen.size, req_cat)
-                chosen.book(real_start, real_end)
+                # ✅ 2) 不再调用 _apply_policy，直接按 Task 3 的真实时间上锁
+                chosen.book(start, end)
+
+                # ✅ 3) 不再计算任何政策费用；若仍想保留基础费，可把 revenue_base=BASE_FEE
                 result.update({
                     'status': 'accepted',
                     'reason': 'accepted_exact' if chosen.size == req_cat else 'accepted_oversize',
                     'assigned_locker_id': chosen.id,
                     'assigned_locker_size': chosen.size,
-                    'real_start': real_start,
-                    'real_end': real_end,
-                    'revenue_base': base,
-                    'revenue_size_upcharge': upc,
-                    'revenue_late_fee': late,
+                    'real_start': start,
+                    'real_end': end,
+                    # 'revenue_base': BASE_FEE,               # <- 如需保留基础费，解除注释
+                    # 'revenue_size_upcharge': 0.0,           # <- 不再收差价/滞纳费
+                    # 'revenue_late_fee': 0.0,
                 })
 
             rows.append(result)
 
         res = pd.DataFrame(rows)
-        # 便于后续聚合的日期/小时字段
-        res['date'] = res['desired_start'].dt.date
-        res['hour'] = res['desired_start'].dt.hour
+
+        # ✅ 4) 统计口径改为真实开始时间（而不是 desired_start）
+        res['date'] = pd.to_datetime(res['real_start']).dt.date
+        res['hour'] = pd.to_datetime(res['real_start']).dt.hour
         return res
+
 
 
 # =========================
