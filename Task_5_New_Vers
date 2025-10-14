@@ -4,7 +4,6 @@ Task 5 - Locker Bank Operation Simulator (HIGH-PERFORMANCE VERSION)
 Author: (your name)
 Last Update: 2025-10-11
 """
-!pip install intervaltree
 import os, json, math, warnings
 import numpy as np
 import pandas as pd
