@@ -1,0 +1,282 @@
+# -*- coding: utf-8 -*-
+"""
+Task 5 - Locker Bank Operation Simulator (Directly Integrated with Task 4 Heuristics)
+Author: (your name)
+Last Update: 2025-10-15
+
+功能：
+- 运行 Task 5 原有的 strawman 和 smarter 启发式。
+- *** 新增: 直接嵌入了 Task 4 的 strawman 和 cost-minimization (smarter) 启发式作为对比。***
+- *** 优化: 采用了性能更优的 Locker 类（bisect 查找）。***
+"""
+
+import os, json, math, warnings, bisect
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from collections import defaultdict
+
+warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
+
+# =========================
+# 全局参数（保持 Task 5 原有结构）
+# =========================
+INPUT_DEMAND_CSV = "Task_3_Outcome/task3_demand_instance_two_level_cv.csv" # 请根据实际情况修改
+OUT_DIR = "Task_5_Outcome"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ... (Task 5 的其他参数保持不变) ...
+GRID_HEIGHT = 15
+ROW_HEIGHT_CM = 10
+BASE_FLOOR_TO_ROW0_CM = 30
+SIZE_UNITS = {'small': 1, 'medium': 2, 'large': 3}
+USER_HEIGHT_DIST_CM = {'p05': 155, 'p50': 170, 'p95': 185}
+ARM_REACH_OFFSET_CM = 70
+REACH_SAFETY_MARGIN_CM = 10
+POLICY_EARLY_ARRIVE_MAX_MIN = 90
+POLICY_LATE_PICKUP_MAX_H = 180
+BASE_FEE = 5.0
+SIZE_UPCHARGE = {'small': 0.0, 'medium': 1.5, 'large': 3.0}
+LATE_FEE_STEP = 0.20
+LOOKAHEAD_HOURS = 48
+SIZE_PROTECTION_LARGE_THRESHOLD = 0.15
+RANDOM_SEED = 20251010
+np.random.seed(RANDOM_SEED)
+NUM_SMALL = 40
+NUM_MEDIUM = 71
+NUM_LARGE = 41
+SLA_DAILY_TARGET = 0.995
+WARMUP_DAYS = 2.0
+
+# *** 新增: 从Task 4 引入的成本参数 ***
+OVERSIZE_OPPORTUNITY_COST_PER_LEVEL = 4.0
+
+# =========================
+# 工具函数与数据结构
+# =========================
+
+# *** 新增: 从Task 4 引入的功能完整的 get_ergonomic_cost 函数 ***
+def get_ergonomic_cost(req_size_cat, assigned_size_cat, y_pos):
+    y = y_pos + 1
+    cost = 0.0
+    size_map = {'small': 1, 'medium': 2, 'large': 3}
+    d_req, d_assigned = size_map.get(req_size_cat), size_map.get(assigned_size_cat)
+    if d_req is None or d_assigned is None or d_assigned < d_req: return float('inf')
+
+    if d_req == 1 and d_assigned == 1:   cost = 0.01 * (115 - 15*y) if y <= 7 else 0.01 * (-95 + 15*y)
+    elif d_req == 1 and d_assigned == 2: cost = 0.01 * ((75 + (65/6)) - (65/6)*y) if y <= 7 else 0.01 * (10 - 7*(65/6) + (65/6)*y)
+    elif d_req == 1 and d_assigned == 3: cost = 0.01 * ((50 + (40/6)) - (40/6)*y) if y <= 7 else 0.01 * (10 - 7*(40/6) + (40/6)*y)
+    elif d_req == 2 and d_assigned == 2: cost = 0.01 * ((10 - (65/14)) + (65/14)*y)
+    elif d_req == 2 and d_assigned == 3: cost = 0.01 * ((10 - (90/14)) + (90/14)*y)
+    elif d_req == 3 and d_assigned == 3: cost = 0.01 * ((10 - (90/14)) + (90/14)*y)
+    return max(0, cost)
+
+# ... (Task 5 的其他工具函数保持不变) ...
+def reachable_row_range_for_user():
+    h = np.random.normal(USER_HEIGHT_DIST_CM['p50'], 3.0) 
+    reach_max_cm = h + ARM_REACH_OFFSET_CM - REACH_SAFETY_MARGIN_CM
+    reach_min_cm = max(0, h * 0.35)
+    max_row = min(GRID_HEIGHT - 1, int(round((reach_max_cm - BASE_FLOOR_TO_ROW0_CM) / ROW_HEIGHT_CM)))
+    min_row = max(0, int(round((reach_min_cm - BASE_FLOOR_TO_ROW0_CM) / ROW_HEIGHT_CM)))
+    return (min_row, max_row) if min_row <= max_row else (0, GRID_HEIGHT - 1)
+
+# *** 优化: 使用Task 4中带 bisect 优化的 Locker 类 ***
+class Locker:
+    def __init__(self, locker_id, size_category, position_rc):
+        self.id, self.size, self.position, self.schedule = locker_id, size_category, position_rc, []
+    def is_available(self, start, end):
+        if not self.schedule: return True
+        idx = bisect.bisect_right(self.schedule, (start, start))
+        if idx > 0 and self.schedule[idx - 1][1] > start: return False
+        if idx < len(self.schedule) and self.schedule[idx][0] < end: return False
+        return True
+    def book(self, start, end):
+        bisect.insort(self.schedule, (start, end))
+
+class LockerBank:
+    # ... (保持 Task 5 原有实现不变) ...
+    def __init__(self, num_s, num_m, num_l, height=GRID_HEIGHT):
+        self.height = height; self.lockers = []
+        self._create_layout(num_s, num_m, num_l)
+    def _create_layout(self, num_s, num_m, num_l):
+        specs = [('small', num_s), ('medium', num_m), ('large', num_l)]
+        current_row, current_col, lid = 0, 0, 0
+        for size, cnt in specs:
+            h_units = SIZE_UNITS[size]
+            for _ in range(cnt):
+                if current_row + h_units > self.height: current_row, current_col = 0, current_col + 1
+                center_row = current_row + (h_units - 1) / 2.0
+                self.lockers.append(Locker(lid, size, (int(round(center_row)), current_col)))
+                current_row += h_units; lid += 1
+    def total_lockers(self): return len(self.lockers)
+
+class AssignmentAgent:
+    def __init__(self, locker_bank: LockerBank):
+        self.lb = locker_bank; self._build_req_size_map()
+        self.total_large = sum(1 for L in self.lb.lockers if L.size == 'large')
+    def _build_req_size_map(self):
+        m = {}; [m.update({s: 'small'}) for s in range(1, 4)]; [m.update({s: 'medium'}) for s in range(4, 10)]; [m.update({s: 'large'}) for s in range(10, 19)]
+        self.req_size_map = m
+    @staticmethod
+    def _size_value(cat): return {'small': 1, 'medium': 2, 'large': 3}.get(cat, 0)
+    
+    # --- 辅助函数 ---
+    def _get_candidates(self, req_cat, start, end, rr):
+        req_v = self._size_value(req_cat)
+        return [L for L in self.lb.lockers if self._size_value(L.size) >= req_v
+                and (rr[0] <= L.position[0] <= rr[1]) and L.is_available(start, end)]
+    
+    def _apply_policy_and_price(self, desired_start, desired_end, assigned_size, req_size, locker_position_row=0):
+        rs = max(desired_start - pd.Timedelta(minutes=POLICY_EARLY_ARRIVE_MAX_MIN), desired_start.floor('h'))
+        re = min(desired_end + pd.Timedelta(hours=POLICY_LATE_PICKUP_MAX_H), desired_end.ceil('h'))
+        base, upc = BASE_FEE, SIZE_UPCHARGE.get(assigned_size, 0.0)
+        planned, actual = (desired_end - desired_start).total_seconds(), (re - rs).total_seconds()
+        late_fee = 0.0
+        if planned > 0 and actual > planned: late_fee = int(math.ceil((actual - planned)/planned / LATE_FEE_STEP)) * LATE_FEE_STEP * base
+        return rs, re, base, upc, late_fee, get_ergonomic_cost(req_size, assigned_size, locker_position_row)
+
+    # --- Heuristic 1 & 2: Task 5 原有算法 ---
+    def assign_t5_strawman(self, req_cat, start, end, rr):
+        cands = self._get_candidates(req_cat, start, end, rr)
+        cands.sort(key=lambda L: (self._size_value(L.size) - self._size_value(req_cat), L.position[1], abs(L.position[0] - GRID_HEIGHT//2)))
+        return cands[0] if cands else None
+
+    def assign_t5_smarter(self, req_cat, start, end, rr):
+        cands = self._get_candidates(req_cat, start, end, rr)
+        if not cands: return None
+        return max(cands, key=lambda L: self._smarter_score(L, req_cat, start, end))
+    
+    def _smarter_score(self, locker: Locker, req_cat, start, end): # Task 5 smarter 的打分逻辑
+        # ... (此部分逻辑保持不变) ...
+        req_v, size_diff = self._size_value(req_cat), self._size_value(locker.size) - self._size_value(req_cat)
+        size_score = 1.0 / (1 + 2.0 * max(0, size_diff))
+        ergo_soft = 1.0 - min(1.0, abs(locker.position[0] - GRID_HEIGHT/2) / (GRID_HEIGHT/2)) * 0.6
+        next_start = float('inf')
+        for s, e in locker.schedule:
+            if s >= end: next_start = s; break
+        future = 1.0 if next_start == float('inf') else max(0.0, min(1.0, (next_start - end).total_seconds()/3600 / LOOKAHEAD_HOURS))
+        protect_penalty = 0.0
+        if locker.size == 'large' and size_diff > 0:
+            remain_ratio = (self.total_large - sum(1 for L in self.lb.lockers if L.size=='large' and L.schedule)) / self.total_large
+            if remain_ratio < SIZE_PROTECTION_LARGE_THRESHOLD: protect_penalty = (SIZE_PROTECTION_LARGE_THRESHOLD - remain_ratio) * 0.8
+        return (0.40 * size_score) + (0.30 * ergo_soft) + (0.30 * future) - protect_penalty
+        
+    # *** 新增: Heuristic 3 - Task 4 的 Strawman 逻辑 (Best-Fit) ***
+    def assign_t4_strawman(self, req_cat, start, end, rr):
+        candidates = self._get_candidates(req_cat, start, end, rr)
+        if not candidates: return None
+        # Task 4 的 Strawman 更简单：按尺寸 value 和 id 排序即可
+        candidates.sort(key=lambda l: (self._size_value(l.size), l.id))
+        return candidates[0]
+
+    # *** 新增: Heuristic 4 - Task 4 的 Smarter 逻辑 (Cost Minimization) ***
+    def assign_t4_smarter_cost_min(self, req_cat, start, end, rr):
+        candidates = self._get_candidates(req_cat, start, end, rr)
+        if not candidates: return None
+        
+        best_locker, min_cost = None, float('inf')
+        req_v = self._size_value(req_cat)
+        
+        for locker in candidates:
+            ergo_cost = get_ergonomic_cost(req_cat, locker.size, locker.position[0])
+            oversize_penalty = (self._size_value(locker.size) - req_v) * OVERSIZE_OPPORTUNITY_COST_PER_LEVEL
+            total_cost = ergo_cost + oversize_penalty
+            if total_cost < min_cost:
+                best_locker, min_cost = locker, total_cost
+        return best_locker
+
+
+class LockerBankSimulator:
+    def __init__(self, locker_bank: LockerBank, demand_df: pd.DataFrame, agent: AssignmentAgent, heuristic='smarter', warmup_days=WARMUP_DAYS):
+        self.lb = locker_bank; self.demand = demand_df.copy(); self.agent = agent; self.heuristic = heuristic
+        self.warmup_days = warmup_days; self.results = pd.DataFrame()
+    def _req_category(self, v_ft3):
+        v = int(math.ceil(float(v_ft3))) if pd.notna(v_ft3) else 1
+        return self.agent.req_size_map.get(max(1, min(18, v)), 'large')
+    
+    def run(self):
+        # ... (主循环前部分不变) ...
+        start_ts = self.demand['real_deposit_dt'].min(); warmup_cut = start_ts + pd.Timedelta(days=self.warmup_days)
+        demand_array = self.demand[['package_id', 'min_size_ft3', 'real_deposit_dt', 'real_pickup_dt']].to_numpy()
+        rows = []
+        for r_data in tqdm(demand_array, desc=f"Simulating ({self.heuristic})", ncols=90):
+            pkg, min_size_ft3, start_dt, end_dt = r_data
+            start, end = pd.to_datetime(start_dt), pd.to_datetime(end_dt)
+            req_cat = self._req_category(min_size_ft3)
+            rr = reachable_row_range_for_user()
+            
+            chosen = None
+            # 修改: 添加对新启发式的调用
+            if self.heuristic == 't5_strawman': chosen = self.agent.assign_t5_strawman(req_cat, start, end, rr)
+            elif self.heuristic == 't5_smarter': chosen = self.agent.assign_t5_smarter(req_cat, start, end, rr)
+            elif self.heuristic == 't4_strawman': chosen = self.agent.assign_t4_strawman(req_cat, start, end, rr)
+            elif self.heuristic == 't4_smarter_cost_min': chosen = self.agent.assign_t4_smarter_cost_min(req_cat, start, end, rr)
+
+            # ... (结果处理部分不变) ...
+            row = {'package_id': pkg, 'required_size': req_cat, 'status': 'rejected', 'assigned_locker_size': None,
+                   'real_start': pd.NaT, 'real_end': pd.NaT, 'revenue_base': 0.0,
+                   'revenue_size_upcharge': 0.0, 'revenue_late_fee': 0.0, 'date': start.date(),
+                   'keep_for_eval': start >= warmup_cut, 'ergonomic_cost': 0.0}
+            if chosen:
+                rs, re, base, upc, late, ergo_cost = self.agent._apply_policy_and_price(start, end, chosen.size, req_cat, chosen.position[0])
+                chosen.book(rs, re)
+                row.update({'status': 'accepted', 'assigned_locker_size': chosen.size, 'real_start': rs, 'real_end': re,
+                            'revenue_base': base, 'revenue_size_upcharge': upc, 'revenue_late_fee': late, 'ergonomic_cost': ergo_cost})
+            rows.append(row)
+            
+        self.results = pd.DataFrame(rows)
+        
+    def summarize(self, tag: str):
+        # ... (结果汇总和绘图函数保持不变) ...
+        eval_df = self.results[self.results['keep_for_eval']]
+        if eval_df.empty: print(f"No data for eval in {tag}"); return
+        
+        daily_sl = eval_df.groupby('date')['status'].apply(lambda s: (s == 'accepted').mean()).reset_index(name='service_level')
+        overall_sl = (eval_df['status']=='accepted').mean()
+        min_daily_sl = daily_sl['service_level'].min() if not daily_sl.empty else 0
+        breach_days = (daily_sl['service_level'] < SLA_DAILY_TARGET).sum() if not daily_sl.empty else 0
+        total_rev = eval_df[['revenue_base', 'revenue_size_upcharge', 'revenue_late_fee']].sum().sum()
+        total_ergo_cost = eval_df['ergonomic_cost'].sum()
+
+        print(f"\n--- {tag.upper()} SUMMARY ---")
+        print(f"  Overall Service Level: {overall_sl:.3%}")
+        print(f"  Minimum Daily SL: {min_daily_sl:.3%}")
+        print(f"  Days Breaching SLA Target: {breach_days}")
+        print(f"  Total Revenue: ${total_rev:,.2f}")
+        print(f"  Total Ergonomic Cost: {total_ergo_cost:,.2f}")
+        
+        eval_df.to_csv(os.path.join(OUT_DIR, f"{tag}_results.csv"), index=False)
+
+def main():
+    if not os.path.exists(INPUT_DEMAND_CSV):
+        # 创建一个假的输入文件
+        print(f"Input file not found, creating dummy: {INPUT_DEMAND_CSV}")
+        pd.DataFrame({
+            'package_id': range(30000), 'min_size_ft3': np.random.randint(1, 19, 30000),
+            'real_deposit_dt': pd.to_datetime('2025-10-15') + pd.to_timedelta(np.random.rand(30000) * 30, 'D'),
+            'real_pickup_dt': pd.to_datetime('2025-10-15') + pd.to_timedelta(np.random.rand(30000) * 30 + np.random.uniform(0.2, 2.0, 30000), 'D')
+        }).to_csv(INPUT_DEMAND_CSV, index=False)
+        
+    demand_df = pd.read_csv(INPUT_DEMAND_CSV, parse_dates=['real_deposit_dt','real_pickup_dt'])
+    print(f"Loaded {len(demand_df):,} records. Output dir: '{OUT_DIR}'")
+
+    # --- 定义要运行的所有仿真 ---
+    simulations_to_run = [
+        ('A_T5_Strawman', 't5_strawman'),
+        ('B_T5_Smarter', 't5_smarter'),
+        ('C_T4_Strawman_BestFit', 't4_strawman'),
+        ('D_T4_Smarter_CostMin', 't4_smarter_cost_min')
+    ]
+
+    for tag, heuristic_name in simulations_to_run:
+        bank = LockerBank(NUM_SMALL, NUM_MEDIUM, NUM_LARGE)
+        agent = AssignmentAgent(bank)
+        sim = LockerBankSimulator(bank, demand_df, agent, heuristic=heuristic_name)
+        sim.run()
+        sim.summarize(tag=tag)
+
+    print(f"\n✅ All simulations complete. Results are in '{OUT_DIR}'.")
+
+if __name__ == '__main__':
+    main()
