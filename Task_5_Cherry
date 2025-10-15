@@ -9,6 +9,7 @@ Last Update: 2025-10-15
 - *** 新增: 直接嵌入了 Task 4 的 strawman 和 cost-minimization (smarter) 启发式作为对比。***
 - *** 优化: 采用了性能更优的 Locker 类（bisect 查找）。***
 - *** 性能升级: 采用多核并行计算，并为每个并行任务提供独立的进度条。***
+- *** 指标增强: 在总结报告中增加了储物柜利用率（Utilization）指标。***
 """
 
 import os, json, math, warnings, bisect, time
@@ -45,9 +46,9 @@ LOOKAHEAD_HOURS = 48
 SIZE_PROTECTION_LARGE_THRESHOLD = 0.15
 RANDOM_SEED = 20251010
 np.random.seed(RANDOM_SEED)
-NUM_SMALL = 40
-NUM_MEDIUM = 71
-NUM_LARGE = 41
+NUM_SMALL = 44
+NUM_MEDIUM = 51
+NUM_LARGE = 30
 SLA_DAILY_TARGET = 0.995
 WARMUP_DAYS = 2.0
 OVERSIZE_OPPORTUNITY_COST_PER_LEVEL = 4.0
@@ -162,15 +163,11 @@ class AssignmentAgent:
         return best_locker
 
 class LockerBankSimulator:
-    # =========================
-    # === 第1处修改 ===
-    # =========================
-    # 在构造函数中接收 position 参数
     def __init__(self, locker_bank: LockerBank, demand_df: pd.DataFrame, agent: AssignmentAgent, heuristic='smarter', warmup_days=WARMUP_DAYS, position=0):
         self.lb = locker_bank; self.demand = demand_df.copy(); self.agent = agent
         self.heuristic = heuristic; self.warmup_days = warmup_days
         self.results = pd.DataFrame()
-        self.position = position # <-- 存储进度条的行号
+        self.position = position 
 
     def _req_category(self, v_ft3):
         v = int(math.ceil(float(v_ft3))) if pd.notna(v_ft3) else 1
@@ -181,14 +178,10 @@ class LockerBankSimulator:
         demand_array = self.demand[['package_id', 'min_size_ft3', 'real_deposit_dt', 'real_pickup_dt']].to_numpy()
         rows = []
         
-        # =========================
-        # === 第2处修改 ===
-        # =========================
-        # 启用tqdm并使用 position 参数，同时美化描述信息
         progress_bar = tqdm(
             demand_array,
-            desc=f"Sim ({self.heuristic})".ljust(30), # <-- ljust用于对齐
-            position=self.position, # <-- 关键！为这个任务的进度条指定行号
+            desc=f"Sim ({self.heuristic})".ljust(30), 
+            position=self.position, 
             ncols=100
         )
         
@@ -219,32 +212,66 @@ class LockerBankSimulator:
         
     def summarize(self, tag: str):
         eval_df = self.results[self.results['keep_for_eval']]
-        if eval_df.empty: return
+        if eval_df.empty: return "--- NO DATA FOR EVALUATION ---"
+        
+        # === 基本指标计算 ===
         daily_sl = eval_df.groupby('date')['status'].apply(lambda s: (s == 'accepted').mean()).reset_index(name='service_level')
         overall_sl = (eval_df['status']=='accepted').mean()
         min_daily_sl = daily_sl['service_level'].min() if not daily_sl.empty else 0
         breach_days = (daily_sl['service_level'] < SLA_DAILY_TARGET).sum() if not daily_sl.empty else 0
         total_rev = eval_df[['revenue_base', 'revenue_size_upcharge', 'revenue_late_fee']].sum().sum()
         total_ergo_cost = eval_df['ergonomic_cost'].sum()
+        
+        # ==========================================================
+        # === 新增: Utilization (利用率) 计算逻辑 ===
+        # ==========================================================
+        sim_start_time = eval_df['real_start'].min()
+        sim_end_time = eval_df['real_end'].max()
+        
+        util_s, util_m, util_l, util_overall = 0, 0, 0, 0
+        if pd.notna(sim_start_time) and pd.notna(sim_end_time) and sim_end_time > sim_start_time:
+            total_period_hours = (sim_end_time - sim_start_time).total_seconds() / 3600.0
+            
+            occupied_hours = defaultdict(float)
+            total_available_hours = defaultdict(float)
+
+            for locker in self.lb.lockers:
+                total_available_hours[locker.size] += total_period_hours
+                for start, end in locker.schedule:
+                    overlap_start = max(start, sim_start_time)
+                    overlap_end = min(end, sim_end_time)
+                    if overlap_end > overlap_start:
+                        occupied_duration_hours = (overlap_end - overlap_start).total_seconds() / 3600.0
+                        occupied_hours[locker.size] += occupied_duration_hours
+            
+            total_occupied = sum(occupied_hours.values())
+            total_available = sum(total_available_hours.values())
+            
+            util_s = (occupied_hours['small'] / total_available_hours['small']) if total_available_hours['small'] > 0 else 0
+            util_m = (occupied_hours['medium'] / total_available_hours['medium']) if total_available_hours['medium'] > 0 else 0
+            util_l = (occupied_hours['large'] / total_available_hours['large']) if total_available_hours['large'] > 0 else 0
+            util_overall = (total_occupied / total_available) if total_available > 0 else 0
+        # ==========================================================
+        
         summary_text = (
             f"\n--- {tag.upper()} SUMMARY ---\n"
             f"  Overall Service Level: {overall_sl:.3%}\n"
             f"  Minimum Daily SL: {min_daily_sl:.3%}\n"
             f"  Days Breaching SLA Target: {breach_days}\n"
             f"  Total Revenue: ${total_rev:,.2f}\n"
-            f"  Total Ergonomic Cost: {total_ergo_cost:,.2f}"
+            f"  Total Ergonomic Cost: {total_ergo_cost:,.2f}\n"
+            # === 新增: 在输出中加入 Utilization ===
+            f"  Utilization (S/M/L/Overall): {util_s:.2%}, {util_m:.2%}, {util_l:.2%}, {util_overall:.2%}"
         )
+        
         eval_df.to_csv(os.path.join(OUT_DIR, f"{tag}_results.csv"), index=False)
-        return summary_text # <-- 返回总结文本，而不是直接打印
+        with open(os.path.join(OUT_DIR, f"{tag}_summary.txt"), 'w', encoding='utf-8') as f:
+            f.write(summary_text)
+        return summary_text 
 
 # =========================
 # === 并行计算执行部分 ===
 # =========================
-
-# =========================
-# === 第3处修改 ===
-# =========================
-# 封装函数增加 position 参数
 def run_single_simulation(tag, heuristic_name, demand_df, num_s, num_m, num_l, position):
     """
     封装单个模拟任务，以便于并行调用。
@@ -252,11 +279,9 @@ def run_single_simulation(tag, heuristic_name, demand_df, num_s, num_m, num_l, p
     """
     bank = LockerBank(num_s, num_m, num_l)
     agent = AssignmentAgent(bank)
-    # 将 position 传递给模拟器
     sim = LockerBankSimulator(bank, demand_df, agent, heuristic=heuristic_name, position=position)
     sim.run()
     summary = sim.summarize(tag=tag)
-    # 返回标签和总结文本
     return tag, summary
 
 def main():
@@ -274,17 +299,14 @@ def main():
     simulations_to_run = [
         ('A_T5_Strawman', 't5_strawman'),
         ('B_T5_Smarter', 't5_smarter'),
+        ('C_T4_Strawman', 't4_strawman'),
+        ('D_T4_Smarter_Cost_Min', 't4_smarter_cost_min'),
     ]
 
     n_cores = os.cpu_count() or 1
     print(f"\n🚀 Starting parallel simulations on {n_cores} cores...")
-    # 在主循环前留出足够的空行，以防进度条覆盖上面的打印信息
     print("\n" * (len(simulations_to_run)))
     
-    # =========================
-    # === 第4处修改 ===
-    # =========================
-    # 使用 enumerate 为每个任务分配一个唯一的 position ID
     results = Parallel(n_jobs=n_cores)(
         delayed(run_single_simulation)(
             tag,
@@ -293,13 +315,12 @@ def main():
             NUM_SMALL,
             NUM_MEDIUM,
             NUM_LARGE,
-            i # <-- 传递唯一的行号 (0, 1, 2, ...)
+            i 
         ) for i, (tag, heuristic_name) in enumerate(simulations_to_run)
     )
 
     print("\n--- All simulations finished. Generating summaries... ---")
     
-    # 按原始顺序（通过tag排序）打印总结
     for tag, summary_text in sorted(results):
         print(summary_text)
 
