@@ -232,7 +232,7 @@ if __name__ == '__main__':
     ### CHOOSE YOUR SIMULATION MODE HERE ###
     # 'random':  A different probabilistic path each time you run.
     # 'highest': A deterministic high-demand path for stress testing.
-    SIMULATION_MODE = 'highest' 
+    SIMULATION_MODE = 'random' 
     
     demand_df = generate_five_year_demand_instance(simulation_mode=SIMULATION_MODE)
     
