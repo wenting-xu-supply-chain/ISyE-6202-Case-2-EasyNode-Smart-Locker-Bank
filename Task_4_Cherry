@@ -53,8 +53,8 @@ CONFIG = {
     # ——模拟与I/O——
     'simulation': {
         'random_seed': 42,
-        'input_demand_csv': "Task_3_Outcome/task3_demand_instance_two_level_cv.csv",
-        'output_dir': "Task_4_Outcome_Refactored",
+        'input_demand_csv': "Task_3_Outcome/task3_demand_instance_highest_mode.csv",
+        'output_dir': "Task_4_Outcome",
     },
     # ——基线柜体配置——
     'baseline_bank': {
