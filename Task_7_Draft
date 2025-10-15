@@ -1,0 +1,325 @@
+# -*- coding: utf-8 -*-
+# Task 7 - Final Integrated Heuristic Optimizer (with explicit final S/M/L counts)
+# Author: Gemini AI (refined)
+# Last Update: 2025-10-15
+#
+# 功能:
+# - 自动执行 Phase 1/2/3 的启发式优化循环（以 Task_5_Fast.py 为仿真引擎）。
+# - 与基线设计对比，选择推荐设计。
+# - 明确输出最终推荐的 small/medium/large 数量：
+#   1) 控制台打印
+#   2) 保存 CSV: final_recommended_design_counts.csv
+#   3) 保存 JSON: final_recommended_design_counts.json
+#   4) 同时在 final_comparison_summary.csv 中汇总
+#
+# 说明: 若 Task_5_Fast.py 的变量名与这里注入的变量（NUM_SMALL/NUM_MEDIUM/NUM_LARGE）不一致，
+# 你可以在 run_and_analyze_design() 的注入段进行调整以匹配你的模拟器。
+
+from __future__ import annotations
+import os, sys, re, json, time, subprocess
+from pathlib import Path
+from typing import Dict, Any
+import pandas as pd
+import numpy as np
+from scipy.stats import poisson
+
+print("--- [Task 7] Final Heuristic Optimizer Initializing ---")
+TARGET_SERVICE_LEVEL = 0.995
+MAX_ITERATIONS = 10
+MIN_LOCKERS_PER_SIZE = 5
+
+BASE_DIR = Path(__file__).resolve().parent
+SIMULATOR_SCRIPT_SRC = BASE_DIR / "Task_5_Fast.py"
+OUTPUT_DIR = BASE_DIR / "Task_7_Outcome_Final"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# 案例中的关键比例（可调）
+PEAK_4_WEEK_SHARE = 0.13
+PEAK_DAY_OF_WEEK_SHARE = 0.20
+
+# 空间/尺寸占比（示例，需与你的 Task 1/3 结果对齐）
+SPACE_REQUIREMENT_PROB = {
+    'small': 0.08 + 0.12 + 0.15,
+    'medium': 0.12 + 0.08 + 0.06 + 0.05 + 0.05 + 0.05,
+    'large': 0.04 + 0.04 + 0.03 + 0.03 + 0.03 + 0.02 + 0.02 + 0.02 + 0.01
+}
+
+# 年度需求场景（示例，见案例）
+SCENARIO_DEMANDS = {
+    '1.1': 50000, '1.2': 60000, '1.3': 80000, '2.1': 60000, '2.2': 65000, '2.3': 70000, '2.4': 90000, '2.5': 100000,
+    '3.1': 60000, '3.2': 70000, '3.3': 75000, '3.4': 100000, '3.5': 110000, '4.1': 60000, '4.2': 75000, '4.3': 80000,
+    '4.4': 105000, '4.5': 120000, '5.1': 60000, '5.2': 65000, '5.3': 90000, '5.4': 110000, '5.5': 150000
+}
+
+# 基线设计（如需替换成你的 Task 1/2 的 baseline，可改此处）
+BASELINE_DESIGN = {'small': 27, 'medium': 32, 'large': 18}
+
+# 评估标签（与 Task_5_Fast 的输出标签匹配）
+EVALUATION_TAG = "B_T4_Smarter_Cost_Min"  # 若 Task_5_Fast 输出 T5 标签，可改为 B_T5_Smarter
+
+# ---------------------------------------------
+# 工具函数
+# ---------------------------------------------
+def safe_replace_assign(src_code: str, var_name: str, new_value: str) -> str:
+    pat = re.compile(rf"^{re.escape(var_name)}\s*=\s*.*$", re.MULTILINE)
+    repl = f"{var_name} = {new_value}"
+    return pat.sub(repl, src_code, count=1) if pat.search(src_code) else (src_code + f"\n{repl}\n")
+
+def run_subprocess_live(cmd_list, cwd_path: Path) -> int:
+    print(f"\n  Executing: {' '.join(map(str, cmd_list))}")
+    print(f"  In Directory: {cwd_path}")
+    proc = subprocess.Popen(cmd_list, cwd=cwd_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    for line in proc.stdout:
+        sys.stdout.write(line)
+    proc.wait()
+    return proc.returncode
+
+# ---------------------------------------------
+# 启发式核心
+# ---------------------------------------------
+def generate_initial_design() -> Dict[str, int]:
+    print("\n--- Phase 1: Generating Initial Optimized Design ---")
+    avg_demand = float(np.mean(list(SCENARIO_DEMANDS.values())))
+    parcels_in_peak_period = avg_demand * PEAK_4_WEEK_SHARE
+    avg_parcels_per_week_peak = parcels_in_peak_period / 4.0
+    peak_day_demand = avg_parcels_per_week_peak * PEAK_DAY_OF_WEEK_SHARE
+
+    # 假设平均占用时长（小时），可根据 Task 5 的统计更新
+    avg_duration_hours = 11.10
+    arrival_rate_hourly = peak_day_demand / 24.0
+    avg_occupied_lockers = arrival_rate_hourly * avg_duration_hours
+
+    total_lockers_needed = int(poisson.ppf(TARGET_SERVICE_LEVEL, avg_occupied_lockers))
+    num_s = round(total_lockers_needed * SPACE_REQUIREMENT_PROB['small'])
+    num_m = round(total_lockers_needed * SPACE_REQUIREMENT_PROB['medium'])
+    num_l = max(total_lockers_needed - num_s - num_m, 0)
+
+    initial = {'small': int(max(num_s, MIN_LOCKERS_PER_SIZE)),
+               'medium': int(max(num_m, MIN_LOCKERS_PER_SIZE)),
+               'large': int(max(num_l, MIN_LOCKERS_PER_SIZE))}
+    print(f"  -> Initial design: {initial} (total={sum(initial.values())})")
+    return initial
+
+def run_and_analyze_design(design_config: Dict[str, int], iteration_tag: str):
+    print(f"\n--- Phase 2: Simulating & Analyzing Design for [{iteration_tag}] ---")
+    run_dir = OUTPUT_DIR / f"run_{iteration_tag}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    temp_sim_script = run_dir / "_temp_simulator.py"
+
+    if not SIMULATOR_SCRIPT_SRC.exists():
+        print(f"FATAL: Simulator not found at {SIMULATOR_SCRIPT_SRC}")
+        return None
+
+    # 动态注入参数到 Task_5_Fast.py
+    sim_code = SIMULATOR_SCRIPT_SRC.read_text(encoding="utf-8")
+    sim_code = safe_replace_assign(sim_code, "OUT_DIR", f'r"{str(run_dir)}"')
+    # 若你的模拟器用其它变量名（例如 LOCKERS_S/M/L），在这里对应替换
+    sim_code = safe_replace_assign(sim_code, "NUM_SMALL", str(design_config['small']))
+    sim_code = safe_replace_assign(sim_code, "NUM_MEDIUM", str(design_config['medium']))
+    sim_code = safe_replace_assign(sim_code, "NUM_LARGE", str(design_config['large']))
+
+    # 强制仅跑我们关心的启发式（若你的脚本有 simulations_to_run 列表）
+    sim_code = safe_replace_assign(sim_code, "simulations_to_run", f"[('{EVALUATION_TAG}', 't4_smarter_cost_min')]")
+
+    temp_sim_script.write_text(sim_code, encoding="utf-8")
+    try:
+        rc = run_subprocess_live([sys.executable, str(temp_sim_script)], cwd_path=BASE_DIR)
+        if rc != 0:
+            print(f"  -> ERROR: simulator exit {rc}")
+            return None
+
+        # 读取输出
+        summary = run_dir / f"{EVALUATION_TAG}_summary.txt"
+        results = run_dir / f"{EVALUATION_TAG}_results.csv"
+        if not summary.exists() or not results.exists():
+            # Fallback 自动检测
+            cand_sum = sorted(run_dir.glob("*_summary.txt"))
+            cand_res = sorted(run_dir.glob("*_results.csv"))
+            if cand_sum and cand_res:
+                summary = cand_sum[0]
+                results = cand_res[0]
+                print(f"  -> Fallback using: {summary.name}, {results.name}")
+            else:
+                print("  -> ERROR: Cannot find simulator outputs.")
+                return None
+
+        # 解析 KPI（正则请匹配你实际的 summary 格式）
+        t = summary.read_text(encoding="utf-8")
+        kv = {}
+        def grab(pattern, cast):
+            m = re.search(pattern, t)
+            return cast(m.group(1)) if m else None
+
+        kv['overall_sl'] = (grab(r"Overall Service Level:\s*([\d\.]+)%", float) or 0.0) / 100.0
+        kv['min_daily_sl'] = (grab(r"Minimum Daily SL:\s*([\d\.]+)%", float) or 0.0) / 100.0
+        kv['breach_days'] = int(grab(r"Days Breaching SLA Target:\s*(\d+)", int) or 0)
+        kv['total_revenue'] = float((grab(r"Total Revenue:\s*\$([\d,\.]+)", str) or "0").replace(",", ""))
+        kv['total_ergo_cost'] = float((grab(r"Total Ergonomic Cost:\s*([\d,\.]+)", str) or "0").replace(",", ""))
+
+        # 可选：利用率与拒单画像（如你的 results.csv 字段不同，请调整）
+        df = pd.read_csv(results)
+        if 'status' in df.columns:
+            rej = df[df['status'].eq('rejected')]
+            kv['rejection_profile'] = rej['required_size'].value_counts().to_dict() if 'required_size' in rej.columns else {}
+        else:
+            kv['rejection_profile'] = {}
+
+        if {'real_start','real_end','date','assigned_locker_size'}.issubset(df.columns):
+            df['duration_hours'] = (pd.to_datetime(df['real_end']) - pd.to_datetime(df['real_start'])).dt.total_seconds()/3600.0
+            total_days = (pd.to_datetime(df['date']).max() - pd.to_datetime(df['date']).min()).days or 1
+            util = {}
+            for size, count in design_config.items():
+                if count > 0:
+                    hours = df[df['assigned_locker_size'].eq(size)]['duration_hours'].sum()
+                    util[size] = hours / (count * total_days * 24.0)
+                else:
+                    util[size] = 0.0
+            kv['utilization_profile'] = util
+
+        print(f"  -> SL={kv['overall_sl']:.3%}, minSL={kv['min_daily_sl']:.3%}, revenue=${kv['total_revenue']:,.2f}")
+        return kv
+    finally:
+        if temp_sim_script.exists():
+            temp_sim_script.unlink()
+
+def propose_next_design(current: Dict[str,int], kpis: Dict[str,Any]) -> Dict[str,int]:
+    print("\n--- Phase 3: Proposing Next Design ---")
+    new_d = current.copy()
+    sl = kpis.get('overall_sl', 0.0)
+    import pandas as pd
+    rej = pd.Series(kpis.get('rejection_profile', {})).reindex(['small','medium','large'], fill_value=0)
+    util = pd.Series(kpis.get('utilization_profile', {})).reindex(['small','medium','large'], fill_value=0.0)
+
+    print(f"  -> Diagnostics: SL={sl:.3%}, Rejections={rej.to_dict()}, Utilization={ {k: f'{v:.2%}' for k,v in util.items()} }")
+
+    if sl < TARGET_SERVICE_LEVEL:
+        # 服务水平不足：找拒单最多的尺寸增加；若存在利用率低的尺寸且数量>最小值，则做一次替换
+        size_need = rej.idxmax()
+        pool = util[util.index != size_need]
+        if not pool.empty and pool.min() < 0.80:
+            cand = pool.idxmin()
+            if new_d[cand] > MIN_LOCKERS_PER_SIZE:
+                new_d[cand] -= 1
+                new_d[size_need] += 1
+                print(f"  -> Swap: -1 {cand}, +1 {size_need}")
+            else:
+                new_d[size_need] += 1
+                print(f"  -> Add: +1 {size_need} (no removable redundant)")
+        else:
+            new_d[size_need] += 1
+            print(f"  -> Add: +1 {size_need}")
+    else:
+        # 服务水平达标：尝试减少利用率最低的尺寸（>最小值）以优化成本
+        cand = util.idxmin()
+        if new_d[cand] > MIN_LOCKERS_PER_SIZE:
+            new_d[cand] -= 1
+            print(f"  -> Reduce: -1 {cand} (optimize cost)")
+        else:
+            print("  -> No change (at minimum).")
+
+    return new_d
+
+# ---------------------------------------------
+# 主流程
+# ---------------------------------------------
+def main():
+    if not SIMULATOR_SCRIPT_SRC.exists():
+        print(f"FATAL: Simulator script '{SIMULATOR_SCRIPT_SRC}' not found.")
+        return
+
+    # Step 1: 评估基线
+    print("\n" + "="*60)
+    print("--- STEP 1: Evaluating Baseline Design ---")
+    print("="*60)
+    baseline_kpis = run_and_analyze_design(BASELINE_DESIGN, "baseline")
+    if not baseline_kpis:
+        print("Baseline simulation failed.")
+        return
+
+    # Step 2: 启发式迭代
+    print("\n" + "="*60)
+    print("--- STEP 2: Heuristic Iteration Loop ---")
+    print("="*60)
+    current = generate_initial_design()
+    history = []
+
+    for i in range(MAX_ITERATIONS):
+        print(f"\n---------- Iteration {i+1}/{MAX_ITERATIONS} ----------")
+        kpis = run_and_analyze_design(current, f"iter_{i+1}")
+        if not kpis:
+            break
+        history.append({'iteration': i+1, 'design': current.copy(), 'kpis': kpis})
+        next_d = propose_next_design(current, kpis)
+        if next_d == current:
+            print("\nDesign converged. Stop.")
+            break
+        current = next_d
+        time.sleep(0.5)
+
+    # Step 3: 选择最佳设计
+    print("\n" + "="*60)
+    print("--- STEP 3: Best Design & Final Report ---")
+    print("="*60)
+    if not history:
+        recommended_design = BASELINE_DESIGN
+        recommended_kpis = baseline_kpis
+        chosen_label = "baseline"
+    else:
+        feasible = [h for h in history if h['kpis'].get('overall_sl',0) >= TARGET_SERVICE_LEVEL]
+        if feasible:
+            best = max(feasible, key=lambda x: x['kpis'].get('total_revenue',0))
+            chosen_label = f"iter_{best['iteration']}"
+        else:
+            best = max(history, key=lambda x: x['kpis'].get('overall_sl',0))
+            chosen_label = f"iter_{best['iteration']} (highest SL)"
+        recommended_design = best['design']
+        recommended_kpis = best['kpis']
+
+    # 明确打印并保存最终 S/M/L 数量
+    final_counts = {
+        "small": int(recommended_design['small']),
+        "medium": int(recommended_design['medium']),
+        "large": int(recommended_design['large']),
+        "total": int(sum(recommended_design.values())),
+        "chosen_from": chosen_label
+    }
+    print("\n✅ FINAL RECOMMENDED LOCKER COUNTS")
+    print(f"   small = {final_counts['small']}")
+    print(f"   medium = {final_counts['medium']}")
+    print(f"   large = {final_counts['large']}")
+    print(f"   total = {final_counts['total']}  (chosen: {final_counts['chosen_from']})")
+
+    counts_csv = OUTPUT_DIR / "final_recommended_design_counts.csv"
+    counts_json = OUTPUT_DIR / "final_recommended_design_counts.json"
+    pd.DataFrame([final_counts]).to_csv(counts_csv, index=False)
+    counts_json.write_text(json.dumps(final_counts, indent=2), encoding="utf-8")
+    print(f"   -> Saved counts CSV: {counts_csv}")
+    print(f"   -> Saved counts JSON: {counts_json}")
+
+    # 汇总表（含对比）
+    summary_df = pd.DataFrame({
+        "Metric": ["", "Config: Small", "Config: Medium", "Config: Large", "Config: Total Lockers",
+                   "", "Overall Service Level", "Min Daily SL", "SLA Breach Days",
+                   "", "Total Revenue", "Total Ergonomic Cost"],
+        "Baseline Design": [
+            "", BASELINE_DESIGN['small'], BASELINE_DESIGN['medium'], BASELINE_DESIGN['large'], sum(BASELINE_DESIGN.values()),
+            "", f"{baseline_kpis.get('overall_sl',0):.3%}", f"{baseline_kpis.get('min_daily_sl',0):.3%}", f"{baseline_kpis.get('breach_days',0)}",
+            "", f"${baseline_kpis.get('total_revenue',0):,.2f}", f"{baseline_kpis.get('total_ergo_cost',0):,.2f}"
+        ],
+        "Recommended Design (Task 7)": [
+            "", final_counts['small'], final_counts['medium'], final_counts['large'], final_counts['total'],
+            "", f"{recommended_kpis.get('overall_sl',0):.3%}", f"{recommended_kpis.get('min_daily_sl',0):.3%}", f"{recommended_kpis.get('breach_days',0)}",
+            "", f"${recommended_kpis.get('total_revenue',0):,.2f}", f"{recommended_kpis.get('total_ergo_cost',0):,.2f}"
+        ]
+    })
+    final_summary_path = OUTPUT_DIR / "final_comparison_summary.csv"
+    print("\n" + "="*60)
+    print("--- FINAL PERFORMANCE COMPARISON ---")
+    print(summary_df.to_string(index=False))
+    print("="*60)
+    summary_df.to_csv(final_summary_path, index=False)
+    print(f"\n✅ Final summary saved to '{final_summary_path}'")
+    print(f"✅ All artifacts saved in '{OUTPUT_DIR}'")
+
+if __name__ == "__main__":
+    main()
