@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Task 4 - Refactored: Dynamic Assignment Simulation with Strategy Pattern
-Author: Senior Software Engineer (Refactored from Gemini AI)
+Task 4 - Refactored & Improved: Dynamic Assignment Simulation with Strategy Pattern
+Author: Senior Software Engineer (Refactored from Gemini AI, Improved by user feedback)
 Last Update: 2025-10-15
 
-功能概述 (Refactored):
+功能概述 (Refactored & Improved):
 1) 架构模式: 采用策略模式（Strategy Pattern），将启发式算法模块化，易于扩展。
    - `StrawmanHeuristic`: 实现了简单的“最小适配”策略。
    - `SmarterHeuristic`: 实现了基于综合成本（人体工学+机会成本）的优化策略。
+   - `ImprovedSmarterHeuristic`: [新增] 采纳了专家建议，加入了“行带覆盖率惩罚”和“非通用格子奖励”，并优化了成本系数，以保护稀缺资源，提升SL。
 2) 效率优化: Locker.is_available() 使用二分查找 (bisect)，将时间冲突检查复杂度从O(n)降至O(log n)。
 3) 配置管理: 所有参数集中到 CONFIG 字典中，便于维护和实验。
 4) 数据结构: 统一的 SIZE_CONFIG，整合了尺寸的所有属性。
@@ -48,13 +49,18 @@ CONFIG = {
     },
     # ——成本与定价参数——
     'costs': {
-        'oversize_opportunity_cost_per_level': 4.0, # 机会成本惩罚系数
+        # [修改 - 补丁 B] 降低 oversize 惩罚，避免其过度影响决策
+        'oversize_opportunity_cost_per_level': 1.5,
+        # [新增 - 补丁 A] 引入行覆盖惩罚系数
+        'row_coverage_penalty_coeff': 1.5,
+        # [新增 - 补丁 C] 引入非通用格子奖励系数
+        'genericity_reward_coeff': 0.05,
     },
     # ——模拟与I/O——
     'simulation': {
         'random_seed': 42,
-        'input_demand_csv': "Task_3_Outcome/task3_demand_instance_highest_mode.csv",
-        'output_dir': "Task_4_Outcome",
+        'input_demand_csv': "Task_3_Outcome/task3_demand_instance_random_mode.csv",
+        'output_dir': "Task_4_Outcome_Improved",
     },
     # ——基线柜体配置——
     'baseline_bank': {
@@ -70,10 +76,10 @@ np.random.seed(CONFIG['simulation']['random_seed'])
 
 
 # =========================
-# 工具与成本计算函数 (Unchanged logic, using CONFIG)
+# 工具与成本计算函数
 # =========================
 def get_ergonomic_cost(req_size_cat: str, assigned_size_cat: str, y_pos: int) -> float:
-    # ... (此函数逻辑不变，因为它已经很完善) ...
+    # ... (此函数逻辑不变) ...
     y = y_pos + 1
     cost = 0.0
     size_map = {'small': 1, 'medium': 2, 'large': 3}
@@ -89,7 +95,6 @@ def get_ergonomic_cost(req_size_cat: str, assigned_size_cat: str, y_pos: int) ->
 
     return max(0, cost)
 
-# ... (其他辅助函数如 sample_user_height_cm, get_reachable_row_range 等保持不变，但内部可引用CONFIG) ...
 def sample_user_height_cm() -> float:
     dist = CONFIG['ergonomics']['user_height_dist_cm']
     r = np.random.rand()
@@ -105,37 +110,33 @@ def get_reachable_row_range() -> tuple[int, int]:
     min_row = max(0, int(round((reach_min_cm - CONFIG['grid']['base_floor_to_row0_cm']) / CONFIG['grid']['row_height_cm'])))
     return (min_row, max_row) if min_row <= max_row else (0, CONFIG['grid']['height'] - 1)
 
+# [新增 - 补丁 A] 增加行带覆盖率权重的计算函数
+def row_coverage_weight(row: int, H: int = CONFIG['grid']['height']) -> float:
+    """
+    计算行的覆盖权重。中心行权重高，表示更“通用”或“稀缺”，应被惩罚。
+    """
+    center = (H - 1) / 2.0
+    # 使用二次函数使中心行权重变大
+    return 1.0 + ((row - center) ** 2) / (center ** 2 + 1e-9)
+
 # =========================
-# 2. 数据结构优化 (Data Structure Optimization)
+# 2. 数据结构优化
 # =========================
 class Locker:
     def __init__(self, locker_id, size_category, position_rc):
         self.id = locker_id
         self.size = size_category
         self.position = position_rc
-        # schedule 存储 (start_time, end_time) 元组，并始终保持排序
         self.schedule = []
 
     def is_available(self, start, end):
-        """
-        [OPTIMIZED] 使用 bisect 进行高效的时间冲突检查 (O(log n))。
-        """
         if not self.schedule: return True
-
-        # 找到第一个可能与新预订冲突的现有预订的索引
         idx = bisect.bisect_right(self.schedule, (start, start))
-
-        # 检查前一个预订是否与新预订的开始时间重叠
-        if idx > 0 and self.schedule[idx - 1][1] > start:
-            return False
-        # 检查后一个预订是否与新预订的结束时间重叠
-        if idx < len(self.schedule) and self.schedule[idx][0] < end:
-            return False
-            
+        if idx > 0 and self.schedule[idx - 1][1] > start: return False
+        if idx < len(self.schedule) and self.schedule[idx][0] < end: return False
         return True
 
     def book(self, start, end):
-        # 使用 bisect.insort 保持列表排序，比 append + sort 更高效
         bisect.insort(self.schedule, (start, end))
 
 class LockerBank:
@@ -161,16 +162,14 @@ class LockerBank:
         return len(self.lockers)
     
     def reset(self):
-        """重置所有储物柜的预定状态，以便进行新的模拟。"""
         for locker in self.lockers:
             locker.schedule = []
 
 
 # =========================
-# 3. 核心分配 Agent 与策略模式 (Assignment Agent & Strategy Pattern)
+# 3. 核心分配 Agent 与策略模式
 # =========================
 class HeuristicStrategy:
-    """策略模式的基类 (Interface)"""
     def choose_locker(self, available_lockers, req_cat):
         raise NotImplementedError
 
@@ -179,24 +178,56 @@ class StrawmanHeuristic(HeuristicStrategy):
     def choose_locker(self, available_lockers, req_cat):
         if not available_lockers:
             return None
-        
-        # 按尺寸升序，ID升序排序，实现 Best-Fit
         available_lockers.sort(key=lambda l: (CONFIG['size_config'][l.size]['value'], l.id))
         return available_lockers[0]
 
 class SmarterHeuristic(HeuristicStrategy):
-    """智能策略：选择综合成本最低的储物柜"""
+    """原始智能策略：选择综合成本最低的储物柜（未修改，用于对比）"""
+    def choose_locker(self, available_lockers, req_cat):
+        if not available_lockers:
+            return None
+        best_locker, min_cost = None, float('inf')
+        req_v = CONFIG['size_config'][req_cat]['value']
+        for locker in available_lockers:
+            ergo_cost = get_ergonomic_cost(req_cat, locker.size, locker.position[0])
+            # 注意：这里的 oversize_opportunity_cost_per_level 会使用 CONFIG 中更新后的值 (1.5)
+            # 如果想完全对比原始 4.0 的效果，需要硬编码或传入参数
+            oversize_penalty = (CONFIG['size_config'][locker.size]['value'] - req_v) * 4.0 # 硬编码 4.0 以保留原始行为
+            total_cost = ergo_cost + oversize_penalty
+            if total_cost < min_cost:
+                best_locker, min_cost = locker, total_cost
+        return best_locker
+
+class ImprovedSmarterHeuristic(HeuristicStrategy):
+    """[新增] 改进后的智能策略：应用了补丁A, B, C"""
     def choose_locker(self, available_lockers, req_cat):
         if not available_lockers:
             return None
 
         best_locker, min_cost = None, float('inf')
         req_v = CONFIG['size_config'][req_cat]['value']
+        C_ROW = CONFIG['costs']['row_coverage_penalty_coeff']
+        C_GEN = CONFIG['costs']['genericity_reward_coeff']
         
         for locker in available_lockers:
-            ergo_cost = get_ergonomic_cost(req_cat, locker.size, locker.position[0])
+            row_pos = locker.position[0]
+            
+            # 1. 人体工学成本
+            ergo_cost = get_ergonomic_cost(req_cat, locker.size, row_pos)
+            
+            # 2. [补丁 B] Oversize 机会成本 (使用 CONFIG 中软化后的值)
             oversize_penalty = (CONFIG['size_config'][locker.size]['value'] - req_v) * CONFIG['costs']['oversize_opportunity_cost_per_level']
-            total_cost = ergo_cost + oversize_penalty
+            
+            # 3. [补丁 A] 行带覆盖率惩罚 (中心行更“贵”)
+            coverage_w = row_coverage_weight(row_pos)
+            coverage_penalty = C_ROW * coverage_w
+            
+            # 4. [补丁 C] 非通用格子奖励 (边缘行获得小奖励)
+            genericity = 1.0 / coverage_w
+            genericity_reward = C_GEN * genericity
+            
+            # 综合成本：人体工学 + 尺寸机会成本 + 中心行惩罚 - 边缘行奖励
+            total_cost = ergo_cost + oversize_penalty + coverage_penalty - genericity_reward
             
             if total_cost < min_cost:
                 best_locker, min_cost = locker, total_cost
@@ -210,7 +241,6 @@ class AssignmentAgent:
         self._build_req_size_map()
 
     def _build_req_size_map(self):
-        # 预计算ft3到尺寸类别的映射，提高效率
         m = {}
         for s in range(1, 4): m[s] = 'small'
         for s in range(4, 10): m[s] = 'medium'
@@ -226,7 +256,7 @@ class AssignmentAgent:
         return rmin <= locker.position[0] <= rmax
 
     def run_simulation(self, demand_df: pd.DataFrame):
-        self.lb.reset() # 确保每次运行前储物柜都是空的
+        self.lb.reset()
         results, df = [], demand_df.copy().dropna().sort_values('real_deposit_dt').reset_index(drop=True)
 
         for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Simulating ({self.strategy.__class__.__name__})"):
@@ -235,7 +265,6 @@ class AssignmentAgent:
             start, end = pd.to_datetime(row['real_deposit_dt']), pd.to_datetime(row['real_pickup_dt'])
             reach_range = get_reachable_row_range()
 
-            # 1. 统一筛选所有可用储物柜
             available_lockers = [
                 locker for locker in self.lb.lockers
                 if CONFIG['size_config'][locker.size]['value'] >= req_v
@@ -243,7 +272,6 @@ class AssignmentAgent:
                 and locker.is_available(start, end)
             ]
             
-            # 2. 将决策委托给策略对象
             chosen_locker = self.strategy.choose_locker(available_lockers, req_cat)
             
             res = {'package_id': row['package_id'], 'required_size': req_cat,
@@ -271,9 +299,8 @@ class AssignmentAgent:
 # 绩效度量与可视化 (Unchanged)
 # =========================
 def compute_and_plot_performance(df_result: pd.DataFrame, total_lockers: int, prefix: str):
-    # ... (此部分逻辑完全不变，已经非常完善) ...
+    # ... (此部分逻辑完全不变) ...
     output_dir = CONFIG['simulation']['output_dir']
-    # 1. Daily Service Level
     daily_sl = df_result.groupby('date').agg(
         requests=('package_id', 'count'),
         accepted=('status', lambda s: (s == 'accepted').sum())
@@ -292,10 +319,7 @@ def compute_and_plot_performance(df_result: pd.DataFrame, total_lockers: int, pr
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f'{prefix}_daily_service_level.png'), dpi=150)
     plt.close()
-
-    # (其他绘图和统计代码保持不变)
     
-    # 3. Aggregate Stats
     overall_sl = daily_sl['accepted'].sum() / daily_sl['requests'].sum() if not daily_sl.empty else 0
     min_daily_sl = daily_sl['service_level'].min() if not daily_sl.empty else 0
     total_revenue = df_result['revenue'].sum()
@@ -325,7 +349,7 @@ def main():
         print(f"\nERROR: Input file not found at '{input_csv}'")
         print("Creating a dummy demand file for demonstration purposes.")
         dummy_data = {
-            'package_id': range(10000), # 增加数据量以测试性能
+            'package_id': range(10000),
             'min_size_ft3': np.random.randint(1, 19, 10000),
             'real_deposit_dt': pd.to_datetime(np.datetime64('2025-10-15T08:00:00') + np.random.rand(10000) * np.timedelta64(10, 'D')),
         }
@@ -336,13 +360,13 @@ def main():
 
     demand_df = pd.read_csv(input_csv, parse_dates=['real_deposit_dt', 'real_pickup_dt'])
     
-    # 创建一个储物柜实例，可以在多个模拟中重复使用
     locker_bank = LockerBank(CONFIG)
 
-    # --- 实例化并运行不同策略 ---
+    # --- 实例化并运行不同策略 (包括新增的改进策略) ---
     strategies = {
         'strawman': StrawmanHeuristic(),
-        'smarter': SmarterHeuristic(),
+        'smarter_original': SmarterHeuristic(),
+        'smarter_improved': ImprovedSmarterHeuristic(),
     }
 
     for name, strategy_instance in strategies.items():
