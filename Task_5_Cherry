@@ -107,6 +107,7 @@ class AssignmentAgent:
     def __init__(self, locker_bank: LockerBank):
         self.lb = locker_bank; self._build_req_size_map()
         self.total_large = sum(1 for L in self.lb.lockers if L.size == 'large')
+        self.booked_large_count = 0 # <-- 新增计数器
     def _build_req_size_map(self):
         m = {}; [m.update({s: 'small'}) for s in range(1, 4)]; [m.update({s: 'medium'}) for s in range(4, 10)]; [m.update({s: 'large'}) for s in range(10, 19)]
         self.req_size_map = m
@@ -130,19 +131,32 @@ class AssignmentAgent:
     def assign_t5_smarter(self, req_cat, start, end, rr):
         cands = self._get_candidates(req_cat, start, end, rr)
         if not cands: return None
-        return max(cands, key=lambda L: self._smarter_score(L, req_cat, start, end))
-    def _smarter_score(self, locker: Locker, req_cat, start, end):
+        
+        # 在循环外计算一次大储物柜的占用情况
+        num_large_used = sum(1 for L in self.lb.lockers if L.size == 'large' and L.schedule and L.schedule[-1][1] > start)
+        large_remain_ratio = (self.total_large - num_large_used) / self.total_large
+        
+        # 将计算好的值传入 _smarter_score
+        return max(cands, key=lambda L: self._smarter_score(L, req_cat, start, end, large_remain_ratio))
+    def _smarter_score(self, locker: Locker, req_cat, start, end, large_remain_ratio):
         req_v, size_diff = self._size_value(req_cat), self._size_value(locker.size) - self._size_value(req_cat)
         size_score = 1.0 / (1 + 2.0 * max(0, size_diff))
         ergo_soft = 1.0 - min(1.0, abs(locker.position[0] - GRID_HEIGHT/2) / (GRID_HEIGHT/2)) * 0.6
+        
         next_start = float('inf')
-        for s, e in locker.schedule:
-            if s >= end: next_start = s; break
+        # 使用 bisect 可以比线性扫描更快地找到下一个日程
+        idx = bisect.bisect_right(locker.schedule, (end, end))
+        if idx < len(locker.schedule):
+            next_start = locker.schedule[idx][0]
+        
         future = 1.0 if next_start == float('inf') else max(0.0, min(1.0, (next_start - end).total_seconds()/3600 / LOOKAHEAD_HOURS))
+        
         protect_penalty = 0.0
         if locker.size == 'large' and size_diff > 0:
-            remain_ratio = (self.total_large - sum(1 for L in self.lb.lockers if L.size=='large' and L.schedule)) / self.total_large
-            if remain_ratio < SIZE_PROTECTION_LARGE_THRESHOLD: protect_penalty = (SIZE_PROTECTION_LARGE_THRESHOLD - remain_ratio) * 0.8
+            # 直接使用传入的参数，不再重新计算
+            if large_remain_ratio < SIZE_PROTECTION_LARGE_THRESHOLD:
+                protect_penalty = (SIZE_PROTECTION_LARGE_THRESHOLD - large_remain_ratio) * 0.8
+                
         return (0.40 * size_score) + (0.30 * ergo_soft) + (0.30 * future) - protect_penalty
     def assign_t4_strawman(self, req_cat, start, end, rr):
         candidates = self._get_candidates(req_cat, start, end, rr)
@@ -293,14 +307,12 @@ def main():
             'real_pickup_dt': pd.to_datetime('2025-10-15') + pd.to_timedelta(np.random.rand(30000) * 30 + np.random.uniform(0.2, 2.0, 30000), 'D')
         }).to_csv(INPUT_DEMAND_CSV, index=False)
         
-    demand_df = pd.read_csv(INPUT_DEMAND_CSV, parse_dates=['real_deposit_dt','real_pickup_dt']).tail(200000)
+    demand_df = pd.read_csv(INPUT_DEMAND_CSV, parse_dates=['real_deposit_dt','real_pickup_dt'])
     print(f"Loaded {len(demand_df):,} records. Output dir: '{OUT_DIR}'")
 
     simulations_to_run = [
         ('A_T5_Strawman', 't5_strawman'),
         ('B_T5_Smarter', 't5_smarter'),
-        ('C_T4_Strawman', 't4_strawman'),
-        ('D_T4_Smarter_Cost_Min', 't4_smarter_cost_min'),
     ]
 
     n_cores = os.cpu_count() or 1
