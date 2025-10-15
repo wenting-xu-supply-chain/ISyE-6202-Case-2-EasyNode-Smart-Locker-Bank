@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
 # =========================
 # 全局参数
 # =========================
-INPUT_DEMAND_CSV = "Task_3_Outcome/task3_demand_instance_highest_mode.csv"
+INPUT_DEMAND_CSV = "Task_3_Outcome/task3_demand_instance_random_mode.csv"
 OUTPUT_DIR = "Task_4_Outcome"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
