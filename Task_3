@@ -60,35 +60,82 @@ def _generate_intra_hour_arrival_minutes(N, lsp_proportion=0.8, lsp_mean=15, lsp
     return list(all_times)
 
 ### MODIFIED FUNCTION ###
-def _simulate_annual_demand_path(mode='random') -> list[int]:
+def _simulate_annual_demand_path(
+    mode: str = 'random',
+    *,
+    alpha: float = 0.6,      # 需求量权重（越大越偏好高需求）
+    beta: float = 0.4,       # 风险厌恶（越大越偏好高概率）
+    smooth: float = 0.15,    # 平滑惩罚（抑制对前一年需求的剧烈偏离）
+    temp: float = 0.25       # softmax 温度（越小越接近贪心）
+) -> list[int]:
     """
-    Simulates a 5-year demand path through the scenario tree.
-    
-    Args:
-        mode (str): 'random' for a probabilistic path, 
-                    'highest' for a deterministic path that always chooses the highest demand option.
-    
-    Returns:
-        list[int]: A list of 5 annual demand values.
+    生成 5 年的年需求路径：
+    - mode='random'  ：按概率抽样
+    - mode='highest' ：总是选下一层中需求值最大的
+    - mode='hybrid'  ：综合考虑概率、需求量和路径平滑度，softmax 采样
+
+    评分函数 (对每一年的候选节点 child)：
+        score = alpha * demand_norm
+              + beta  * prob_norm
+              - smooth * jump_norm
+    然后用 softmax(score/temp) 作为选择分布进行一次抽样。
     """
+    import numpy as np
+
+    def _softmax(x, t=1.0):
+        x = np.array(x, dtype=float) / max(1e-9, t)
+        x = x - x.max()
+        ex = np.exp(x)
+        s = ex.sum()
+        return ex / (s if s > 0 else 1.0)
+
     annual_demands = []
     current_node = 'start'
+    prev_demand = None
+
     for _ in range(5):
         next_states = SCENARIO_TREE[current_node]
-        nodes, probabilities = zip(*next_states)
-        
-        if mode == 'highest':
-            # Deterministic: Find the next node that has the maximum possible demand value
-            chosen_node = max(nodes, key=lambda node: SCENARIO_DEMANDS[node])
-        else: # Default to 'random'
-            # Probabilistic: Choose the next node based on given probabilities
-            chosen_node = np.random.choice(nodes, p=probabilities)
-            
-        annual_demands.append(SCENARIO_DEMANDS[chosen_node])
-        current_node = chosen_node
-        
-    return annual_demands
+        nodes, probs = zip(*next_states)
+        demands = [SCENARIO_DEMANDS[n] for n in nodes]
 
+        if mode == 'highest':
+            chosen_node = nodes[int(np.argmax(demands))]
+        elif mode == 'random':
+            chosen_node = np.random.choice(nodes, p=probs)
+        else:  # 'hybrid'
+            p = np.array(probs, dtype=float)
+            d = np.array(demands, dtype=float)
+
+            # 归一化（避免尺度问题）
+            def _norm(v):
+                v = np.array(v, dtype=float)
+                if v.ptp() < 1e-9:  # 全相等
+                    return np.zeros_like(v)
+                return (v - v.min()) / (v.max() - v.min())
+
+            p_norm = _norm(p)
+            d_norm = _norm(d)
+
+            # 平滑惩罚：与上一年差距越大，惩罚越大
+            if prev_demand is None or prev_demand <= 0:
+                jump_norm = np.zeros_like(d)
+            else:
+                jump = np.abs(d - prev_demand) / prev_demand
+                jump_norm = jump / (jump.max() + 1e-9)
+
+            # 综合评分
+            score = alpha * d_norm + beta * p_norm - smooth * jump_norm
+
+            # softmax 随机选择（温度越小越“贪心”）
+            q = _softmax(score, t=max(1e-6, temp))
+            chosen_node = np.random.choice(nodes, p=q)
+
+        chosen_demand = SCENARIO_DEMANDS[chosen_node]
+        annual_demands.append(chosen_demand)
+        prev_demand = chosen_demand
+        current_node = chosen_node
+
+    return annual_demands
 def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> list[dict]:
     if num_packages <= 0: return []
     package_list = []
