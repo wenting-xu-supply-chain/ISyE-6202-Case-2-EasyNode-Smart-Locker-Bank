@@ -331,7 +331,7 @@ def _search(df, baseline_cfg):
         if patience >= NO_IMPROVE_PATIENCE:
             break
         improved = False
-        for nb in _neighbors(best_cfg):
+        for nb in _neighbors(best_cfg, it):
             kpi = _evaluate_config(df, nb)
             cost_nb = calculate_cost(nb)
             profit_nb = kpi['revenue'] - cost_nb
