@@ -1,0 +1,368 @@
+# -*- coding: utf-8 -*-
+"""
+Task 7 - Fixed-Configuration Locker Bank Design Heuristic (Standalone)
+Author: Alan
+Last Update: 2025-10-16
+
+Changes in this version:
+- Add explicit oversizing penalty into the objective (MU_OVERSIZE * oversize_rate)
+- Prefer exact-size assignment in the smarter heuristic to reduce oversizing
+- Fully standalone (no import from Task 5), outputs to Task_7_Outcome/
+"""
+
+import os, math, bisect, warnings
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
+
+# ==============================
+# ==== Directories & Params ====
+# ==============================
+OUT_DIR = "Task_7_n_Outcome"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+INPUT_DEMAND_CSV = "Task_3_Outcome/task3_demand_instance_random_mode.csv"
+
+GRID_HEIGHT = 15
+ROW_HEIGHT_CM = 10
+BASE_FLOOR_TO_ROW0_CM = 30
+
+SIZE_UNITS = {'small': 1, 'medium': 2, 'large': 3}
+LOCKER_CAPACITY_FT3 = {'small': 3.0, 'medium': 9.0, 'large': 18.0}
+
+USER_HEIGHT_DIST_CM = {'p05': 155, 'p50': 170, 'p95': 185}
+ARM_REACH_OFFSET_CM = 70
+REACH_SAFETY_MARGIN_CM = 10
+
+BASE_FEE = 5.0
+SIZE_UPCHARGE = {'small': 0.0, 'medium': 1.5, 'large': 3.0}
+
+SLA_DAILY_TARGET = 0.995
+WARMUP_DAYS = 2.0
+RANDOM_SEED = 20251010
+np.random.seed(RANDOM_SEED)
+
+# Baseline locker counts (same total as your Task 5 baseline)
+NUM_SMALL, NUM_MEDIUM, NUM_LARGE = 44, 51, 30
+
+# ==============================
+# ==== Ergonomic Cost ==========
+# ==============================
+def get_ergonomic_cost(req_size_cat, assigned_size_cat, y_pos):
+    """
+    Piecewise linear ergonomic cost adapted from the paper-like profile you used before.
+    y_pos is row index (0-based); convert to 1..15 with y = y_pos + 1.
+    """
+    y = y_pos + 1
+    cost = 0.0
+    size_map = {'small': 1, 'medium': 2, 'large': 3}
+    d_req, d_assigned = size_map.get(req_size_cat), size_map.get(assigned_size_cat)
+    if d_req is None or d_assigned is None or d_assigned < d_req:
+        return float('inf')
+    if d_req == 1 and d_assigned == 1:
+        cost = 0.01 * (115 - 15 * y) if y <= 7 else 0.01 * (-95 + 15 * y)
+    elif d_req == 1 and d_assigned == 2:
+        cost = 0.01 * ((75 + (65 / 6)) - (65 / 6) * y) if y <= 7 else 0.01 * (10 - 7 * (65 / 6) + (65 / 6) * y)
+    elif d_req == 1 and d_assigned == 3:
+        cost = 0.01 * ((50 + (40 / 6)) - (40 / 6) * y) if y <= 7 else 0.01 * (10 - 7 * (40 / 6) + (40 / 6) * y)
+    elif d_req == 2 and d_assigned == 2:
+        cost = 0.01 * ((10 - (65 / 14)) + (65 / 14) * y)
+    elif d_req == 2 and d_assigned == 3:
+        cost = 0.01 * ((10 - (90 / 14)) + (90 / 14) * y)
+    elif d_req == 3 and d_assigned == 3:
+        cost = 0.01 * ((10 - (90 / 14)) + (90 / 14) * y)
+    return max(0, cost)
+
+
+def reachable_row_range_for_user():
+    h = np.random.normal(USER_HEIGHT_DIST_CM['p50'], 3.0)
+    reach_max_cm = h + ARM_REACH_OFFSET_CM - REACH_SAFETY_MARGIN_CM
+    reach_min_cm = max(0, h * 0.35)
+    max_row = min(GRID_HEIGHT - 1, int(round((reach_max_cm - BASE_FLOOR_TO_ROW0_CM) / ROW_HEIGHT_CM)))
+    min_row = max(0, int(round((reach_min_cm - BASE_FLOOR_TO_ROW0_CM) / ROW_HEIGHT_CM)))
+    return (min_row, max_row) if min_row <= max_row else (0, GRID_HEIGHT - 1)
+
+# ==============================
+# ==== Locker Simulation =======
+# ==============================
+class Locker:
+    def __init__(self, locker_id, size_category, position_rc):
+        self.id, self.size, self.position, self.schedule = locker_id, size_category, position_rc, []
+
+    def is_available(self, start, end):
+        if not self.schedule: return True
+        idx = bisect.bisect_right(self.schedule, (start, start))
+        if idx > 0 and self.schedule[idx - 1][1] > start: return False
+        if idx < len(self.schedule) and self.schedule[idx][0] < end: return False
+        return True
+
+    def book(self, start, end):
+        bisect.insort(self.schedule, (start, end))
+
+
+class LockerBank:
+    def __init__(self, num_s, num_m, num_l, height=GRID_HEIGHT):
+        self.height = height
+        self.lockers = []
+        self._create_layout(num_s, num_m, num_l)
+
+    def _create_layout(self, num_s, num_m, num_l):
+        specs = [('small', num_s), ('medium', num_m), ('large', num_l)]
+        current_row, current_col, lid = 0, 0, 0
+        for size, cnt in specs:
+            h_units = SIZE_UNITS[size]
+            for _ in range(cnt):
+                if current_row + h_units > self.height:
+                    current_row, current_col = 0, current_col + 1
+                center_row = current_row + (h_units - 1) / 2.0
+                self.lockers.append(Locker(lid, size, (int(round(center_row)), current_col)))
+                current_row += h_units
+                lid += 1
+
+
+class AssignmentAgent:
+    def __init__(self, locker_bank: LockerBank):
+        self.lb = locker_bank
+        self._build_req_size_map()
+
+    def _build_req_size_map(self):
+        m = {}
+        [m.update({s: 'small'}) for s in range(1, 4)]
+        [m.update({s: 'medium'}) for s in range(4, 10)]
+        [m.update({s: 'large'}) for s in range(10, 19)]
+        self.req_size_map = m
+
+    @staticmethod
+    def _size_value(cat): return {'small': 1, 'medium': 2, 'large': 3}.get(cat, 0)
+
+    def _get_candidates(self, req_cat, start, end, rr):
+        req_v = self._size_value(req_cat)
+        return [
+            L for L in self.lb.lockers
+            if self._size_value(L.size) >= req_v
+            and (rr[0] <= L.position[0] <= rr[1])
+            and L.is_available(start, end)
+        ]
+
+    def assign_t5_smarter(self, req_cat, start, end, rr):
+        """
+        NEW: Prefer exact-size candidates to reduce oversizing; if none, fall back to larger ones,
+        and in both cases pick the most ergonomic (closest to middle rows).
+        """
+        cands = self._get_candidates(req_cat, start, end, rr)
+        if not cands:
+            return None
+        exact = [L for L in cands if L.size == req_cat]
+        pool = exact if len(exact) > 0 else cands  # only larger remain if exact empty
+        return min(pool, key=lambda L: abs(L.position[0] - GRID_HEIGHT / 2))
+
+
+class LockerBankSimulator:
+    def __init__(self, locker_bank, demand_df, agent, warmup_days=WARMUP_DAYS):
+        self.lb, self.demand, self.agent = locker_bank, demand_df.copy(), agent
+        self.warmup_days = warmup_days
+        self.results = pd.DataFrame()
+
+    def _req_category(self, v_ft3):
+        v = int(math.ceil(float(v_ft3))) if pd.notna(v_ft3) else 1
+        if v <= 3: return 'small'
+        if v <= 9: return 'medium'
+        return 'large'
+
+    def run(self):
+        start_ts = self.demand['real_deposit_dt'].min()
+        warmup_cut = start_ts + pd.Timedelta(days=self.warmup_days)
+        rows = []
+        for _, r in tqdm(self.demand.iterrows(), total=len(self.demand), desc="Sim (T7)"):
+            pkg, min_size_ft3, start_dt, end_dt = r['package_id'], r['min_size_ft3'], r['real_deposit_dt'], r['real_pickup_dt']
+            start, end = pd.to_datetime(start_dt), pd.to_datetime(end_dt)
+            req_cat = self._req_category(min_size_ft3)
+            rr = reachable_row_range_for_user()
+
+            chosen = self.agent.assign_t5_smarter(req_cat, start, end, rr)
+            row = {
+                'package_id': pkg,
+                'required_size': req_cat,
+                'package_volume_ft3': float(min_size_ft3),
+                'status': 'rejected',
+                'assigned_locker_size': None,
+                'date': start.date(),
+                'keep_for_eval': start >= warmup_cut,
+                'revenue_base': 0.0,
+                'revenue_size_upcharge': 0.0,
+                'ergonomic_cost': 0.0
+            }
+            if chosen:
+                chosen.book(start, end)
+                row.update({
+                    'status': 'accepted',
+                    'assigned_locker_size': chosen.size,
+                    'revenue_base': BASE_FEE,
+                    'revenue_size_upcharge': SIZE_UPCHARGE[chosen.size],
+                    'ergonomic_cost': get_ergonomic_cost(req_cat, chosen.size, chosen.position[0])
+                })
+            rows.append(row)
+        self.results = pd.DataFrame(rows)
+
+# ==============================
+# ==== Evaluation Function =====
+# ==============================
+def _evaluate_config(demand_df, cfg, warmup_days=WARMUP_DAYS):
+    """
+    Run simulation and compute KPIs including oversize_rate for the objective.
+    """
+    bank = LockerBank(cfg['small'], cfg['medium'], cfg['large'])
+    agent = AssignmentAgent(bank)
+    sim = LockerBankSimulator(bank, demand_df, agent, warmup_days=warmup_days)
+    sim.run()
+
+    df = sim.results
+    eval_df = df[df['keep_for_eval']]
+    if eval_df.empty:
+        return dict(
+            overall_sl=0, revenue=0, ergonomic_cost=0,
+            vol_util_overall=0, oversize_rate=0, summary="EMPTY"
+        )
+
+    overall_sl = (eval_df['status'] == 'accepted').mean()
+    revenue = eval_df[['revenue_base', 'revenue_size_upcharge']].sum().sum()
+    ergo_cost = eval_df['ergonomic_cost'].sum()
+
+    acc = eval_df[eval_df['status'] == 'accepted'].copy()
+    if acc.empty:
+        util = 0.0
+        oversize_rate = 0.0
+    else:
+        cap = acc['assigned_locker_size'].map(LOCKER_CAPACITY_FT3)
+        util = acc['package_volume_ft3'].sum() / cap.sum() if cap.sum() > 0 else 0.0
+        oversize_rate = (acc['assigned_locker_size'] != acc['required_size']).mean()
+
+    return dict(
+        overall_sl=overall_sl,
+        revenue=float(revenue),
+        ergonomic_cost=float(ergo_cost),
+        vol_util_overall=float(util),
+        oversize_rate=float(oversize_rate),
+    )
+
+# ==============================
+# ==== Search & Objective  =====
+# ==============================
+LOCKER_FOOTPRINT_M2 = {'small': 0.1, 'medium': 0.2, 'large': 0.3}
+LAMBDA_SLA = 5e6
+MU_OVERSIZE = 5e4         # <-- Oversizing penalty weight (NEW)
+NU_ERGO = 1e2
+XI_UNDERUTIL = 1e4
+TARGET_VOL_UTIL = 0.70
+
+MAX_ITERS, NO_IMPROVE_PATIENCE = 30, 8
+MOVE_SET = [(+1, -1, 0), (-1, +1, 0), (+1, 0, -1), (-1, 0, +1), (0, +1, -1), (0, -1, +1)]
+
+def calculate_cost(cfg):
+    """
+    Simple footprint-based 5-year cost model (investment + maintenance).
+    """
+    c_fix, c_var = 10000, 5000
+    s = (cfg['small'] * LOCKER_FOOTPRINT_M2['small'] +
+         cfg['medium'] * LOCKER_FOOTPRINT_M2['medium'] +
+         cfg['large'] * LOCKER_FOOTPRINT_M2['large'])
+    invest = c_fix + c_var * s
+    return invest + (invest * 0.05 * 5)
+
+def _objective(kpi, profit):
+    """
+    Maximize profit minus penalties: SLA shortfall, oversizing, ergonomics, under-utilization.
+    """
+    score = profit
+    if kpi['overall_sl'] < SLA_DAILY_TARGET:
+        score -= LAMBDA_SLA * (SLA_DAILY_TARGET - kpi['overall_sl'])
+    # NEW: oversize penalty
+    score -= MU_OVERSIZE * kpi['oversize_rate']
+    # existing penalties
+    score -= NU_ERGO * kpi['ergonomic_cost']
+    if kpi['vol_util_overall'] < TARGET_VOL_UTIL:
+        score -= XI_UNDERUTIL * (TARGET_VOL_UTIL - kpi['vol_util_overall'])
+    return score
+
+def _neighbors(cfg):
+    s, m, l = cfg['small'], cfg['medium'], cfg['large']
+    total = s + m + l
+    for ds, dm, dl in MOVE_SET:
+        ns, nm, nl = s + ds, m + dm, l + dl
+        if min(ns, nm, nl) < 0: continue
+        if ns + nm + nl == total:
+            yield {'small': ns, 'medium': nm, 'large': nl}
+
+def _search(df, baseline_cfg):
+    """
+    Local neighborhood search with patience. Uses oversize-aware objective.
+    """
+    best_cfg = baseline_cfg.copy()
+    best_kpi = _evaluate_config(df, best_cfg)
+    best_cost = calculate_cost(best_cfg)
+    best_profit = best_kpi['revenue'] - best_cost
+    best_obj = _objective(best_kpi, best_profit)
+    hist = [dict(**best_cfg, **best_kpi, cost=best_cost, profit=best_profit, objective=best_obj, phase="init")]
+
+    patience = 0
+    for it in range(MAX_ITERS):
+        if patience >= NO_IMPROVE_PATIENCE:
+            break
+        improved = False
+        for nb in _neighbors(best_cfg):
+            kpi = _evaluate_config(df, nb)
+            cost_nb = calculate_cost(nb)
+            profit_nb = kpi['revenue'] - cost_nb
+            obj = _objective(kpi, profit_nb)
+            hist.append(dict(**nb, **kpi, cost=cost_nb, profit=profit_nb, objective=obj, phase=f"iter{it+1}"))
+            if obj > best_obj:
+                best_cfg, best_kpi, best_obj = nb, kpi, obj
+                improved = True
+        patience = 0 if improved else patience + 1
+
+    return best_cfg, best_kpi, pd.DataFrame(hist)
+
+# ==============================
+# ==== Main Run ================
+# ==============================
+def run_task7():
+    if not os.path.exists(INPUT_DEMAND_CSV):
+        raise FileNotFoundError(f"Missing demand file: {INPUT_DEMAND_CSV}")
+
+    df = pd.read_csv(INPUT_DEMAND_CSV, parse_dates=['real_deposit_dt', 'real_pickup_dt'])
+    baseline_cfg = {'small': NUM_SMALL, 'medium': NUM_MEDIUM, 'large': NUM_LARGE}
+
+    base_kpi = _evaluate_config(df, baseline_cfg)
+    base_cost = calculate_cost(baseline_cfg)
+    base_profit = base_kpi['revenue'] - base_cost
+    base_obj = _objective(base_kpi, base_profit)
+
+    best_cfg, best_kpi, traj = _search(df, baseline_cfg)
+    best_cost = calculate_cost(best_cfg)
+    best_profit = best_kpi['revenue'] - best_cost
+    best_obj = _objective(best_kpi, best_profit)
+
+    comp = pd.DataFrame([
+        ['Baseline', *baseline_cfg.values(),
+         base_kpi['overall_sl'], base_kpi['revenue'], base_kpi['vol_util_overall'],
+         base_kpi['oversize_rate'], base_kpi['ergonomic_cost'], base_cost, base_profit, base_obj],
+        ['Recommended', *best_cfg.values(),
+         best_kpi['overall_sl'], best_kpi['revenue'], best_kpi['vol_util_overall'],
+         best_kpi['oversize_rate'], best_kpi['ergonomic_cost'], best_cost, best_profit, best_obj]
+    ], columns=[
+        'Design','Small','Medium','Large',
+        'SL','Revenue','VolUtil','OversizeRate','ErgoCost','Cost','Profit','Objective'
+    ])
+
+    comp.to_csv(os.path.join(OUT_DIR, "task7_comparison.csv"), index=False)
+    traj.to_csv(os.path.join(OUT_DIR, "task7_search_traj.csv"), index=False)
+
+    print("\n=== ✅ Task 7 Completed (Oversize-aware) ===")
+    print(f"Baseline:    SL={base_kpi['overall_sl']:.3f} | Rev={base_kpi['revenue']:.0f} | Util={base_kpi['vol_util_overall']:.2f} | Oversize={base_kpi['oversize_rate']:.2%}")
+    print(f"Recommended: SL={best_kpi['overall_sl']:.3f} | Rev={best_kpi['revenue']:.0f} | Util={best_kpi['vol_util_overall']:.2f} | Oversize={best_kpi['oversize_rate']:.2%}")
+    print(f"Files saved to: {OUT_DIR}")
+
+if __name__ == "__main__":
+    run_task7()
