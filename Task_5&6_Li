@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Task 5/6 - Locker Bank Operation Simulator (MODIFIED to align with Task 7 Objective)
+Task 5/6 - Locker Bank Operation Simulator (MODIFIED to include Task 7 Objective)
 Author: (your name)
 Last Update: 2025-10-16
 
 Changes:
-- Integrated the detailed economic parameters and objective function from Task 7.
-- The `summarize` function now calculates KPIs (Revenue, Cost, Oversize Rate)
-  and a final Objective Score consistent with the Task 7 optimization logic.
-- The core parallel simulation engine remains unchanged.
+- Retains Task 5's original heuristic comparison and parallel processing.
+- Integrates Task 7's economic parameters (R_D, C_L, etc.).
+- Integrates Task 7's objective function.
+- Upgrades the `summarize` function to report both T5/T6 KPIs and T7's
+  economic-based KPIs (Revenue, Cost, Profit, Oversize Rate, Objective Score).
+- FIX: Corrected .UPPER() to .upper() in the summarize function.
+- FIX 2: Corrected OUT_D to OUT_DIR in the final print statement.
 """
 
 import os, json, math, warnings, bisect, time
@@ -29,20 +32,34 @@ OUT_DIR = "Task_5_Outcome_with_T7_Objective"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 GRID_HEIGHT = 15
+ROW_HEIGHT_CM = 10
+BASE_FLOOR_TO_ROW0_CM = 30
 SIZE_UNITS = {'small': 1, 'medium': 2, 'large': 3}
 LOCKER_CAPACITY_FT3 = {'small': 3.0, 'medium': 9.0, 'large': 18.0}
+USER_HEIGHT_DIST_CM = {'p05': 155, 'p50': 170, 'p95': 185}
+ARM_REACH_OFFSET_CM = 70
+REACH_SAFETY_MARGIN_CM = 10
+POLICY_EARLY_ARRIVE_MAX_MIN = 90
+POLICY_LATE_PICKUP_MAX_H = 180
+BASE_FEE = 5.0
+SIZE_UPCHARGE = {'small': 0.0, 'medium': 1.5, 'large': 3.0}
+LATE_FEE_STEP = 0.20
+LOOKAHEAD_HOURS = 48
+SIZE_PROTECTION_LARGE_THRESHOLD = 0.15
 RANDOM_SEED = 20251010
 np.random.seed(RANDOM_SEED)
 
-# Baseline configuration to be evaluated
 NUM_SMALL = 44
 NUM_MEDIUM = 51
 NUM_LARGE = 30
 
 SLA_DAILY_TARGET = 0.995
 WARMUP_DAYS = 2.0
+OVERSIZE_OPPORTUNITY_COST_PER_LEVEL = 4.0
 
-# --- NEW: Economic parameters imported from Task 7 script ---
+# ==========================================================
+# --- [NEW] Task 7 Economic & Objective Parameters ---
+# ==========================================================
 R_D = {'small': 6.10, 'medium': 11.95, 'large': 16.35}
 C_L = {'small': 700.0, 'medium': 1100.0, 'large': 1600.0}
 C_M = 50.0
@@ -50,17 +67,15 @@ C_W = 500.0
 C_S = 50.0
 AMORT_LAMBDA = 30
 N_M_COVER = 14
-# -----------------------------------------------------------
-
-# --- NEW: Objective function parameters from Task 7 script ---
 LAMBDA_SLA = 3e7
 MU_OVERSIZE = 1e6
 XI_UNDERUTIL = 4e5
 TARGET_VOL_UTIL = 0.72
-# -------------------------------------------------------------
+# ==========================================================
 
-# (Ergonomic cost, user sampling, and other policy parameters remain unchanged)
-# ... [Full block of existing functions like get_ergonomic_cost, reachable_row_range_for_user, etc.] ...
+# =========================
+# Utility Functions (Unchanged)
+# =========================
 def get_ergonomic_cost(req_size_cat, assigned_size_cat, y_pos):
     y = y_pos + 1; cost = 0.0; size_map = {'small': 1, 'medium': 2, 'large': 3}
     d_req, d_assigned = size_map.get(req_size_cat), size_map.get(assigned_size_cat)
@@ -72,18 +87,34 @@ def get_ergonomic_cost(req_size_cat, assigned_size_cat, y_pos):
     elif d_req == 2 and d_assigned == 3: cost = 0.01 * ((10 - (90/14)) + (90/14)*y)
     elif d_req == 3 and d_assigned == 3: cost = 0.01 * ((10 - (90/14)) + (90/14)*y)
     return max(0, cost)
+
 def reachable_row_range_for_user():
-    h = np.random.normal(170, 3.0)
-    reach_max_cm = h + 70 - 10
+    h = np.random.normal(USER_HEIGHT_DIST_CM['p50'], 3.0)
+    reach_max_cm = h + ARM_REACH_OFFSET_CM - REACH_SAFETY_MARGIN_CM
     reach_min_cm = max(0, h * 0.35)
-    max_row = min(GRID_HEIGHT - 1, int(round((reach_max_cm - 30) / 10)))
-    min_row = max(0, int(round((reach_min_cm - 30) / 10)))
+    max_row = min(GRID_HEIGHT - 1, int(round((reach_max_cm - BASE_FLOOR_TO_ROW0_CM) / ROW_HEIGHT_CM)))
+    min_row = max(0, int(round((reach_min_cm - BASE_FLOOR_TO_ROW0_CM) / ROW_HEIGHT_CM)))
     return (min_row, max_row) if min_row <= max_row else (0, GRID_HEIGHT - 1)
 
+# ==========================================================
+# --- [NEW] Task 7 Objective Function ---
+# ==========================================================
+def _objective(kpi: dict) -> float:
+    """Profit core + soft penalties (SLA, oversize, under-utilization)."""
+    score = float(kpi['revenue'] - kpi['total_cost'])
+    if kpi['overall_sl'] < SLA_DAILY_TARGET:
+        score -= LAMBDA_SLA * (SLA_DAILY_TARGET - kpi['overall_sl'])
+    score -= MU_OVERSIZE * float(kpi.get('oversize_rate', 0.0))
+    util_gap = max(0.0, TARGET_VOL_UTIL - float(kpi.get('vol_util_overall', 0.0)))
+    score -= XI_UNDERUTIL * util_gap
+    return score
+# ==========================================================
 
-# (Locker, LockerBank, AssignmentAgent, LockerBankSimulator classes remain structurally the same)
-# ... [Full, unchanged class definitions for Locker, LockerBank, etc.] ...
+# =========================
+# Data Structures
+# =========================
 class Locker:
+    # (Locker class unchanged)
     def __init__(self, locker_id, size_category, position_rc):
         self.id, self.size, self.position, self.schedule = locker_id, size_category, position_rc, []
     def is_available(self, start, end):
@@ -95,10 +126,20 @@ class Locker:
     def book(self, start, end): bisect.insort(self.schedule, (start, end))
 
 class LockerBank:
+    """
+    [MODIFIED]
+    - Added self.width and self.num_config to support T7 cost calculation.
+    """
     def __init__(self, num_s, num_m, num_l, height=GRID_HEIGHT):
-        self.height = height; self.lockers = []
+        self.height = height
+        self.lockers = []
         self._create_layout(num_s, num_m, num_l)
+        
+        # --- MODIFIED: Added attributes for T7 cost calculation ---
         self.width = (max((L.position[1] for L in self.lockers), default=-1) + 1)
+        self.num_config = {'small': num_s, 'medium': num_m, 'large': num_l}
+        # --------------------------------------------------------
+
     def _create_layout(self, num_s, num_m, num_l):
         specs = [('small', num_s), ('medium', num_m), ('large', num_l)]
         current_row, current_col, lid = 0, 0, 0
@@ -111,165 +152,256 @@ class LockerBank:
                 current_row += h_units; lid += 1
     def total_lockers(self): return len(self.lockers)
 
-# --- NEW: Objective function copied directly from Task 7 ---
-def _objective(kpi: dict) -> float:
-    """Profit core + soft penalties (SLA, oversize, under-utilization)."""
-    score = float(kpi['revenue'] - kpi['total_cost'])
-    if kpi['overall_sl'] < SLA_DAILY_TARGET:
-        score -= LAMBDA_SLA * (SLA_DAILY_TARGET - kpi['overall_sl'])
-    score -= MU_OVERSIZE * float(kpi.get('oversize_rate', 0.0))
-    util_gap = max(0.0, TARGET_VOL_UTIL - float(kpi.get('vol_util_overall', 0.0)))
-    score -= XI_UNDERUTIL * util_gap
-    return score
-# ---------------------------------------------------------
+
+class AssignmentAgent:
+    # (AssignmentAgent class unchanged, contains all 4 heuristics)
+    def __init__(self, locker_bank: LockerBank):
+        self.lb = locker_bank; self._build_req_size_map()
+        self.total_large = sum(1 for L in self.lb.lockers if L.size == 'large')
+        self.booked_large_count = 0
+    def _build_req_size_map(self):
+        m = {}; [m.update({s: 'small'}) for s in range(1, 4)]; [m.update({s: 'medium'}) for s in range(4, 10)]; [m.update({s: 'large'}) for s in range(10, 19)]
+        self.req_size_map = m
+    @staticmethod
+    def _size_value(cat): return {'small': 1, 'medium': 2, 'large': 3}.get(cat, 0)
+    def _get_candidates(self, req_cat, start, end, rr):
+        req_v = self._size_value(req_cat)
+        return [L for L in self.lb.lockers if self._size_value(L.size) >= req_v and (rr[0] <= L.position[0] <= rr[1]) and L.is_available(start, end)]
+    def _apply_policy_and_price(self, desired_start, desired_end, assigned_size, req_size, locker_position_row=0):
+        rs = max(desired_start - pd.Timedelta(minutes=POLICY_EARLY_ARRIVE_MAX_MIN), desired_start.floor('h'))
+        re = min(desired_end + pd.Timedelta(hours=POLICY_LATE_PICKUP_MAX_H), desired_end.ceil('h'))
+        base, upc = BASE_FEE, SIZE_UPCHARGE.get(assigned_size, 0.0)
+        planned, actual = (desired_end - desired_start).total_seconds(), (re - rs).total_seconds()
+        late_fee = 0.0
+        if planned > 0 and actual > planned: late_fee = int(math.ceil((actual - planned)/planned / LATE_FEE_STEP)) * LATE_FEE_STEP * base
+        return rs, re, base, upc, late_fee, get_ergonomic_cost(req_size, assigned_size, locker_position_row)
+    def assign_t5_strawman(self, req_cat, start, end, rr):
+        cands = self._get_candidates(req_cat, start, end, rr)
+        cands.sort(key=lambda L: (self._size_value(L.size) - self._size_value(req_cat), L.position[1], abs(L.position[0] - GRID_HEIGHT//2)))
+        return cands[0] if cands else None
+    def assign_t5_smarter(self, req_cat, start, end, rr):
+        cands = self._get_candidates(req_cat, start, end, rr)
+        if not cands: return None
+        num_large_used = sum(1 for L in self.lb.lockers if L.size == 'large' and L.schedule and L.schedule[-1][1] > start)
+        large_remain_ratio = (self.total_large - num_large_used) / self.total_large if self.total_large > 0 else 0
+        return max(cands, key=lambda L: self._smarter_score(L, req_cat, start, end, large_remain_ratio))
+    def _smarter_score(self, locker: Locker, req_cat, start, end, large_remain_ratio):
+        req_v, size_diff = self._size_value(req_cat), self._size_value(locker.size) - self._size_value(req_cat)
+        size_score = 1.0 / (1 + 2.0 * max(0, size_diff))
+        ergo_soft = 1.0 - min(1.0, abs(locker.position[0] - GRID_HEIGHT/2) / (GRID_HEIGHT/2)) * 0.6
+        next_start = float('inf')
+        idx = bisect.bisect_right(locker.schedule, (end, end))
+        if idx < len(locker.schedule):
+            next_start = locker.schedule[idx][0]
+        future = 1.0 if next_start == float('inf') else max(0.0, min(1.0, (next_start - end).total_seconds()/3600 / LOOKAHEAD_HOURS))
+        protect_penalty = 0.0
+        if locker.size == 'large' and size_diff > 0:
+            if large_remain_ratio < SIZE_PROTECTION_LARGE_THRESHOLD:
+                protect_penalty = (SIZE_PROTECTION_LARGE_THRESHOLD - large_remain_ratio) * 0.8
+        return (0.40 * size_score) + (0.30 * ergo_soft) + (0.30 * future) - protect_penalty
+    def assign_t4_strawman(self, req_cat, start, end, rr):
+        candidates = self._get_candidates(req_cat, start, end, rr)
+        if not candidates: return None
+        candidates.sort(key=lambda l: (self._size_value(l.size), l.id))
+        return candidates[0]
+    def assign_t4_smarter_cost_min(self, req_cat, start, end, rr):
+        candidates = self._get_candidates(req_cat, start, end, rr)
+        if not candidates: return None
+        best_locker, min_cost = None, float('inf')
+        req_v = self._size_value(req_cat)
+        for locker in candidates:
+            ergo_cost = get_ergonomic_cost(req_cat, locker.size, locker.position[0])
+            oversize_penalty = (self._size_value(locker.size) - req_v) * OVERSIZE_OPPORTUNITY_COST_PER_LEVEL
+            total_cost = ergo_cost + oversize_penalty
+            if total_cost < min_cost:
+                best_locker, min_cost = locker, total_cost
+        return best_locker
 
 class LockerBankSimulator:
-    # ... (The __init__, _req_category, and run methods are unchanged) ...
-    def __init__(self, locker_bank: LockerBank, demand_df: pd.DataFrame, agent, heuristic='smarter', warmup_days=WARMUP_DAYS, position=0):
-        self.lb, self.demand, self.agent = locker_bank, demand_df.copy(), agent
-        self.heuristic, self.warmup_days = heuristic, warmup_days
-        self.results, self.position = pd.DataFrame(), position
+    # (Simulator class unchanged)
+    def __init__(self, locker_bank: LockerBank, demand_df: pd.DataFrame, agent: AssignmentAgent, heuristic='smarter', warmup_days=WARMUP_DAYS, position=0):
+        self.lb = locker_bank; self.demand = demand_df.copy(); self.agent = agent
+        self.heuristic = heuristic; self.warmup_days = warmup_days
+        self.results = pd.DataFrame()
+        self.position = position 
+
     def _req_category(self, v_ft3):
         v = int(math.ceil(float(v_ft3))) if pd.notna(v_ft3) else 1
-        if v <= 3: return 'small'
-        if v <= 9: return 'medium'
-        return 'large'
+        return self.agent.req_size_map.get(max(1, min(18, v)), 'large')
+    
     def run(self):
-        # ... (simulation loop is unchanged) ...
         start_ts = self.demand['real_deposit_dt'].min(); warmup_cut = start_ts + pd.Timedelta(days=self.warmup_days)
         demand_array = self.demand[['package_id', 'min_size_ft3', 'real_deposit_dt', 'real_pickup_dt']].to_numpy()
         rows = []
         progress_bar = tqdm(demand_array, desc=f"Sim ({self.heuristic})".ljust(30), position=self.position, ncols=100)
+        
         for r_data in progress_bar:
             pkg, min_size_ft3, start_dt, end_dt = r_data
             start, end = pd.to_datetime(start_dt), pd.to_datetime(end_dt)
             req_cat = self._req_category(min_size_ft3)
             rr = reachable_row_range_for_user()
-            chosen = self.agent.assign_t5_smarter(req_cat, start, end, rr) # Assuming we always use the best heuristic for eval
-            row = {'package_id': pkg, 'required_size': req_cat, 'package_volume_ft3': min_size_ft3, 'status': 'rejected', 'assigned_locker_size': None, 'real_start': pd.NaT, 'real_end': pd.NaT, 'date': start.date(), 'keep_for_eval': start >= warmup_cut, 'ergonomic_cost': 0.0}
+            
+            chosen = None
+            if self.heuristic == 't5_strawman': chosen = self.agent.assign_t5_strawman(req_cat, start, end, rr)
+            elif self.heuristic == 't5_smarter': chosen = self.agent.assign_t5_smarter(req_cat, start, end, rr)
+            elif self.heuristic == 't4_strawman': chosen = self.agent.assign_t4_strawman(req_cat, start, end, rr)
+            elif self.heuristic == 't4_smarter_cost_min': chosen = self.agent.assign_t4_smarter_cost_min(req_cat, start, end, rr)
+
+            row = {'package_id': pkg, 'required_size': req_cat, 'package_volume_ft3': min_size_ft3, 
+                   'status': 'rejected', 'assigned_locker_size': None,
+                   'real_start': pd.NaT, 'real_end': pd.NaT, 'revenue_base': 0.0,
+                   'revenue_size_upcharge': 0.0, 'revenue_late_fee': 0.0, 'date': start.date(),
+                   'keep_for_eval': start >= warmup_cut, 'ergonomic_cost': 0.0}
             if chosen:
-                row.update({'status': 'accepted', 'assigned_locker_size': chosen.size, 'ergonomic_cost': get_ergonomic_cost(req_cat, chosen.size, chosen.position[0])})
+                rs, re, base, upc, late, ergo_cost = self.agent._apply_policy_and_price(start, end, chosen.size, req_cat, chosen.position[0])
+                chosen.book(rs, re)
+                row.update({'status': 'accepted', 'assigned_locker_size': chosen.size, 'real_start': rs, 'real_end': re,
+                            'revenue_base': base, 'revenue_size_upcharge': upc, 'revenue_late_fee': late, 'ergonomic_cost': ergo_cost})
             rows.append(row)
+            
         self.results = pd.DataFrame(rows)
-
-
-    # --- MODIFIED: The summarize function is completely replaced ---
+        
     def summarize(self, tag: str):
+        # ==========================================================
+        # --- [MODIFIED] Upgraded summarize function ---
+        # ==========================================================
         eval_df = self.results[self.results['keep_for_eval']]
-        if eval_df.empty:
+        if eval_df.empty: 
             print(f"[{tag}] --- NO DATA FOR EVALUATION ---")
             return "--- NO DATA FOR EVALUATION ---"
 
-        # --- KPI Calculation aligned with Task 7 ---
-        # 1. Service Level
-        overall_sl = (eval_df['status'] == 'accepted').mean()
+        # --- 1. Original T5/T6 KPI Calculations ---
+        daily_sl = eval_df.groupby('date')['status'].apply(lambda s: (s == 'accepted').mean()).reset_index(name='service_level')
+        overall_sl_t5 = (eval_df['status']=='accepted').mean()
+        min_daily_sl = daily_sl['service_level'].min() if not daily_sl.empty else 0
+        breach_days = (daily_sl['service_level'] < SLA_DAILY_TARGET).sum() if not daily_sl.empty else 0
+        total_fee_revenue = eval_df[['revenue_base', 'revenue_size_upcharge', 'revenue_late_fee']].sum().sum()
+        
+        # Original Volume Utilization
+        df_success = eval_df[eval_df['status'] == 'accepted'].copy()
+        util_overall_t5 = 0.0
+        if not df_success.empty:
+            df_success['assigned_locker_capacity_ft3'] = df_success['assigned_locker_size'].map(LOCKER_CAPACITY_FT3)
+            total_pkg_vol_all = df_success['package_volume_ft3'].sum()
+            total_locker_cap_all = df_success['assigned_locker_capacity_ft3'].sum()
+            util_overall_t5 = total_pkg_vol_all / total_locker_cap_all if total_locker_cap_all > 0 else 0.0
 
-        # 2. Revenue (using R_D from economic parameters)
+        # --- 2. New T7 KPI Calculations ---
+        # Revenue (T7 Model)
         served = eval_df[eval_df['status'] == 'accepted']
         S_d = served.groupby('required_size').size().reindex(['small', 'medium', 'large'], fill_value=0)
-        revenue = float(sum(R_D[d] * S_d[d] for d in ['small', 'medium', 'large']))
-
-        # 3. Costs
-        ergo_cost = float(served['ergonomic_cost'].sum())
-
+        revenue_t7 = float(sum(R_D[d] * S_d[d] for d in ['small', 'medium', 'large']))
+        
+        # Cost (T7 Model)
+        ergo_cost_t7 = float(served['ergonomic_cost'].sum())
         W = self.lb.width
         H = self.lb.height
         M = int(np.ceil(W / N_M_COVER)) if W > 0 else 0
-        cfg = {'small': NUM_SMALL, 'medium': NUM_MEDIUM, 'large': NUM_LARGE} # Assuming fixed config for this run
+        cfg = self.lb.num_config
         capex = sum(C_L[d] * cfg[d] for d in ['small', 'medium', 'large']) + C_M * M + C_W * W + 2.0 * C_S * (W + H)
-        capex_amort = AMORT_LAMBDA * capex
-        total_cost = ergo_cost + capex_amort
+        capex_amort_t7 = AMORT_LAMBDA * capex
+        total_cost_t7 = ergo_cost_t7 + capex_amort_t7
+        profit_t7 = revenue_t7 - total_cost_t7
         
-        # 4. Utilization and Oversize Rate
-        if served.empty:
-            vol_util_overall, oversize_rate = 0.0, 0.0
-        else:
-            cap = served['assigned_locker_size'].map(LOCKER_CAPACITY_FT3)
-            vol_util_overall = float(served['package_volume_ft3'].sum() / cap.sum()) if cap.sum() > 0 else 0.0
-            oversize_rate = float((served['assigned_locker_size'] != served['required_size']).mean())
-            
-        # 5. Package all KPIs for the objective function
+        # Additional T7 Metrics
+        oversize_rate_t7 = float((served['assigned_locker_size'] != served['required_size']).mean()) if not served.empty else 0.0
+        vol_util_t7 = util_overall_t5 # The definition is identical
+
+        # --- 3. Calculate T7 Objective Score ---
         kpi_dict = {
-            'overall_sl': overall_sl,
-            'revenue': revenue,
-            'total_cost': total_cost,
-            'oversize_rate': oversize_rate,
-            'vol_util_overall': vol_util_overall
+            'overall_sl': overall_sl_t5,
+            'revenue': revenue_t7,
+            'total_cost': total_cost_t7,
+            'oversize_rate': oversize_rate_t7,
+            'vol_util_overall': vol_util_t7
         }
-        
-        # 6. Calculate the final objective score
         objective_score = _objective(kpi_dict)
 
-        # 7. Generate Summary Report
+        # --- 4. Generate Combined Report ---
         summary_text = (
-            f"\n--- {tag.upper()} SUMMARY (T7 OBJECTIVE ALIGNED) ---\n"
-            f"  Service Level: {overall_sl:.3%}\n"
-            f"  Volume Utilization: {vol_util_overall:.2%}\n"
-            f"  Oversize Rate: {oversize_rate:.2%}\n"
+            # --- THIS IS THE CORRECTED LINE ---
+            f"\n--- {tag.upper()} SUMMARY --- (Includes T7 Objective)\n"
+            f"  [T5 Metrics (Fee-Based)]\n"
+            f"  Overall Service Level: {overall_sl_t5:.3%}\n"
+            f"  Minimum Daily SL: {min_daily_sl:.3%}\n"
+            f"  Days Breaching SLA Target: {breach_days}\n"
+            f"  Total Revenue (Fee-Based): ${total_fee_revenue:,.2f}\n"
+            f"  Volume Utilization (Overall): {util_overall_t5:.2%}\n"
             f"  ------------------------------------------\n"
-            f"  Revenue: ${revenue:,.2f}\n"
-            f"  Total Cost (Ergo + Amort. CAPEX): ${total_cost:,.2f}\n"
-            f"  PROFIT (Rev - Cost): ${revenue - total_cost:,.2f}\n"
+            f"  [T7 Metrics (Economics-Based)]\n"
+            f"  Revenue (T7 Model): ${revenue_t7:,.2f}\n"
+            f"  Total Cost (Ergo + Amort. CAPEX): ${total_cost_t7:,.2f}\n"
+            f"  PROFIT (T7 Model): ${profit_t7:,.2f}\n"
+            f"  Oversize Rate: {oversize_rate_t7:.2%}\n"
             f"  ------------------------------------------\n"
             f"  FINAL OBJECTIVE SCORE: {objective_score:,.2f}"
         )
-
+        
         eval_df.to_csv(os.path.join(OUT_DIR, f"{tag}_results.csv"), index=False)
         with open(os.path.join(OUT_DIR, f"{tag}_summary.txt"), 'w', encoding='utf-8') as f:
             f.write(summary_text)
-
         return summary_text
-    # --- END OF MODIFIED SECTION ---
+        # ==========================================================
+        # --- [MODIFICATION END] ---
+        # ==========================================================
 
-# (The main execution block and AssignmentAgent can remain largely the same,
-# but we'll simplify the main block to reflect a focused evaluation run)
-class AssignmentAgent: # A simplified agent for this script
-    def __init__(self, locker_bank: LockerBank):
-        self.lb = locker_bank
-    def assign_t5_smarter(self, req_cat, start, end, rr):
-        cands = [L for L in self.lb.lockers if {'small':1,'medium':2,'large':3}[L.size] >= {'small':1,'medium':2,'large':3}[req_cat] and (rr[0] <= L.position[0] <= rr[1]) and L.is_available(start, end)]
-        if not cands: return None
-        return min(cands, key=lambda L: (abs(L.position[0] - GRID_HEIGHT / 2)))
-
-def run_single_simulation(tag, demand_df, num_s, num_m, num_l, position):
+# =========================
+# === Parallel Execution (Unchanged) ===
+# =========================
+def run_single_simulation(tag, heuristic_name, demand_df, num_s, num_m, num_l, position):
+    # (This function is unchanged)
     bank = LockerBank(num_s, num_m, num_l)
     agent = AssignmentAgent(bank)
-    # Always use the best heuristic for evaluation
-    sim = LockerBankSimulator(bank, demand_df, agent, heuristic='smarter', position=position)
+    sim = LockerBankSimulator(bank, demand_df, agent, heuristic=heuristic_name, position=position)
     sim.run()
     summary = sim.summarize(tag=tag)
     return tag, summary
 
 def main():
     if not os.path.exists(INPUT_DEMAND_CSV):
-        raise FileNotFoundError(f"Input file not found: {INPUT_DEMAND_CSV}")
+        print(f"Input file not found, creating dummy: {INPUT_DEMAND_CSV}")
+        # (Dummy file creation is unchanged)
+        pd.DataFrame({
+            'package_id': range(30000), 'min_size_ft3': np.random.uniform(0.1, 18.0, 30000).round(2),
+            'real_deposit_dt': pd.to_datetime('2025-10-15') + pd.to_timedelta(np.random.rand(30000) * 30, 'D'),
+            'real_pickup_dt': pd.to_datetime('2025-10-15') + pd.to_timedelta(np.random.rand(30000) * 30 + np.random.uniform(0.2, 2.0, 30000), 'D')
+        }).to_csv(INPUT_DEMAND_CSV, index=False)
         
     demand_df = pd.read_csv(INPUT_DEMAND_CSV, parse_dates=['real_deposit_dt','real_pickup_dt'])
-    # Optional: Sample for faster runs
-    # demand_df = demand_df.sample(20000) 
     print(f"Loaded {len(demand_df):,} records. Output dir: '{OUT_DIR}'")
 
+    # (Simulation tasks are unchanged)
     simulations_to_run = [
-        ('A_Baseline_Design_Eval', NUM_SMALL, NUM_MEDIUM, NUM_LARGE),
-        # You could add other designs here to compare, e.g.:
-        # ('B_Improved_Design_Eval', 40, 60, 25), 
+        ('A_T5_Strawman', 't5_strawman'),
+        ('B_T5_Smarter', 't5_smarter'),
+        # ('C_T4_Strawman', 't4_strawman'),
+        # ('D_T4_Smarter_Cost_Min', 't4_smarter_cost_min'),
     ]
 
     n_cores = os.cpu_count() or 1
     print(f"\n🚀 Starting parallel simulations on {n_cores} cores...")
     print("\n" * (len(simulations_to_run)))
     
+    # (Parallel execution is unchanged)
     results = Parallel(n_jobs=n_cores)(
         delayed(run_single_simulation)(
-            tag, demand_df, num_s, num_m, num_l, i
-        ) for i, (tag, num_s, num_m, num_l) in enumerate(simulations_to_run)
+            tag,
+            heuristic_name,
+            demand_df,
+            NUM_SMALL,
+            NUM_MEDIUM,
+            NUM_LARGE,
+            i 
+        ) for i, (tag, heuristic_name) in enumerate(simulations_to_run)
     )
 
-    print("\n--- All simulations finished. Final Summaries: ---")
+    print("\n--- All simulations finished. Generating summaries... ---")
     
-    for _, summary_text in sorted(results):
+    # (Result printing is unchanged)
+    for tag, summary_text in sorted(results):
         print(summary_text)
 
+    # --- THIS IS THE CORRECTED LINE ---
     print(f"\n✅ All simulations complete. Results are in '{OUT_DIR}'.")
 
 if __name__ == '__main__':
