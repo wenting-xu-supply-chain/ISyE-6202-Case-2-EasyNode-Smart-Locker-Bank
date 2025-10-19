@@ -24,7 +24,10 @@ PERIOD_DEMAND_SHARE = {
 }
 DAY_OF_WEEK_SHARE = {
     0: 0.13, 1: 0.12, 2: 0.15, 3: 0.18, 4: 0.20, 5: 0.15, 6: 0.07
-}
+} # PDF shows Su=0.07, Mo=0.13, etc. Code has Mo=0, Tu=1... mapping. We'll assume code's 0=Mo, 6=Su mapping.
+DAY_OF_WEEK_SHARE_FROM_PDF = { 
+    0: 0.13, 1: 0.12, 2: 0.15, 3: 0.18, 4: 0.20, 5: 0.15, 6: 0.07 
+} # Using this to match code's internal logic (0=Monday)
 SCENARIO_TREE = {
     'start': [('1.1', 0.25), ('1.2', 0.25), ('1.3', 0.5)], '1.1': [('2.1', 0.3), ('2.2', 0.4), ('2.3', 0.3)],
     '1.2': [('2.2', 0.6), ('2.3', 0.4)], '1.3': [('2.4', 0.6), ('2.5', 0.4)], '2.1': [('3.1', 0.5), ('3.2', 0.5)],
@@ -40,10 +43,56 @@ SCENARIO_DEMANDS = {
     '3.1': 60000, '3.2': 70000, '3.3': 75000, '3.4': 100000, '3.5': 110000, '4.1': 60000, '4.2': 75000, '4.3': 80000,
     '4.4': 105000, '4.5': 120000, '5.1': 60000, '5.2': 65000, '5.3': 90000, '5.4': 110000, '5.5': 150000
 }
-DAILY_DEPOSIT_DIST = np.array([200, 200, 100, 100, 300, 300, 400, 400, 600, 600, 600, 600, 400, 600, 800, 600, 600, 500, 500, 400, 200, 200, 200, 200])
+
+# --- MODIFIED SECTION: Added full Matrix from Table 3 ---
+
+# Daily deposit distribution (Total column from Table 3)
+DAILY_DEPOSIT_DIST = np.array([200, 200, 100, 100, 300, 300, 400, 400, 600, 600, 600, 600, 400, 600, 800, 600, 600, 600, 500, 500, 400, 200, 200, 200])
 DEPOSIT_HOUR_PROBS = DAILY_DEPOSIT_DIST / DAILY_DEPOSIT_DIST.sum()
-DAILY_PICKUP_DIST = np.array([103, 22, 38, 28, 141, 280, 547, 710, 521, 424, 506, 560, 558, 496, 517, 610, 786, 790, 720, 626, 495, 289, 183, 0])
-PICKUP_HOUR_PROBS = DAILY_PICKUP_DIST / DAILY_PICKUP_DIST.sum()
+
+# Full Deposit-Pickup Matrix (Table 3, Prob x 10,000)
+DEPOSIT_PICKUP_MATRIX = np.array([
+    [30, 20, 4, 4, 4, 10, 20, 24, 32, 20, 12, 12, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 24, 12, 6, 4, 10, 20, 24, 32, 20, 16, 12, 12, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 12, 6, 3, 5, 10, 12, 16, 10, 8, 6, 6, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 12, 6, 3, 10, 12, 16, 10, 8, 6, 6, 4, 4, 3, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 36, 24, 30, 36, 48, 30, 24, 18, 18, 15, 12, 9, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 36, 45, 45, 48, 30, 24, 18, 18, 15, 12, 9, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 60, 60, 72, 44, 32, 24, 24, 20, 16, 16, 20, 12, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 72, 100, 48, 32, 24, 24, 20, 16, 16, 20, 16, 12, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 150, 120, 60, 48, 48, 36, 24, 24, 30, 24, 18, 18, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 96, 90, 60, 36, 24, 24, 36, 42, 30, 18, 12, 12, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 90, 108, 108, 90, 30, 24, 36, 42, 30, 18, 12, 12, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 138, 90, 48, 36, 36, 48, 30, 18, 12, 12, 12, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 80, 100, 40, 32, 32, 40, 40, 12, 8, 8, 4, 4],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 108, 60, 48, 60, 60, 60, 36, 24, 18, 6],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 160, 144, 112, 112, 80, 80, 48, 32, 24, 8],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 120, 120, 90, 66, 36, 24, 18, 6],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 150, 120, 90, 48, 36, 24, 12],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 180, 120, 84, 60, 24, 12],
+    [0, 0, 0, 0, 0, 0, 10, 40, 20, 10, 0, 0, 0, 0, 0, 0, 0, 0, 100, 120, 100, 70, 20, 10],
+    [5, 0, 0, 0, 0, 0, 15, 50, 40, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, 150, 75, 35, 15],
+    [8, 0, 0, 0, 0, 0, 20, 60, 40, 12, 8, 8, 4, 0, 0, 0, 0, 0, 0, 0, 80, 100, 40, 20],
+    [10, 4, 0, 0, 0, 0, 12, 36, 30, 8, 4, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 30, 40, 20],
+    [20, 10, 4, 0, 0, 0, 12, 36, 30, 8, 4, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30, 40],
+    [30, 14, 6, 0, 0, 0, 16, 40, 36, 16, 6, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30]
+], dtype=float)
+
+# Calculate conditional probabilities P(p|d)
+# We divide each row (d) by its sum (which is DAILY_DEPOSIT_DIST[d])
+row_sums_d = DAILY_DEPOSIT_DIST.reshape(-1, 1)
+CONDITIONAL_PICKUP_PROBS_MATRIX = np.divide(
+    DEPOSIT_PICKUP_MATRIX, 
+    row_sums_d, 
+    out=np.zeros_like(DEPOSIT_PICKUP_MATRIX), 
+    where=row_sums_d!=0
+)
+
+# This was the old incorrect constant. We no longer need it.
+# DAILY_PICKUP_DIST = np.array([103, 22, 38, 28, 141, 280, 547, 710, 521, 424, 506, 560, 558, 496, 517, 610, 786, 790, 720, 626, 495, 289, 183, 0])
+# PICKUP_HOUR_PROBS = DAILY_PICKUP_DIST / DAILY_PICKUP_DIST.sum()
+# --- END OF MODIFIED SECTION ---
+
 START_YEAR = 2026
 
 
@@ -60,88 +109,53 @@ def _generate_intra_hour_arrival_minutes(N, lsp_proportion=0.8, lsp_mean=15, lsp
     return list(all_times)
 
 ### MODIFIED FUNCTION ###
-def _simulate_annual_demand_path(
-    mode: str = 'random',
-    *,
-    alpha: float = 0.6,      # 需求量权重（越大越偏好高需求）
-    beta: float = 0.4,       # 风险厌恶（越大越偏好高概率）
-    smooth: float = 0.15,    # 平滑惩罚（抑制对前一年需求的剧烈偏离）
-    temp: float = 0.25       # softmax 温度（越小越接近贪心）
-) -> list[int]:
+def _simulate_annual_demand_path(mode='random') -> list[int]:
     """
-    生成 5 年的年需求路径：
-    - mode='random'  ：按概率抽样
-    - mode='highest' ：总是选下一层中需求值最大的
-    - mode='hybrid'  ：综合考虑概率、需求量和路径平滑度，softmax 采样
-
-    评分函数 (对每一年的候选节点 child)：
-        score = alpha * demand_norm
-              + beta  * prob_norm
-              - smooth * jump_norm
-    然后用 softmax(score/temp) 作为选择分布进行一次抽样。
+    Simulates a 5-year demand path through the scenario tree.
+    
+    Args:
+        mode (str): 'random' for a probabilistic path, 
+                    'highest' for a deterministic path that always chooses the highest demand option.
+    
+    Returns:
+        list[int]: A list of 5 annual demand values.
     """
-    import numpy as np
-
-    def _softmax(x, t=1.0):
-        x = np.array(x, dtype=float) / max(1e-9, t)
-        x = x - x.max()
-        ex = np.exp(x)
-        s = ex.sum()
-        return ex / (s if s > 0 else 1.0)
-
     annual_demands = []
     current_node = 'start'
-    prev_demand = None
-
     for _ in range(5):
         next_states = SCENARIO_TREE[current_node]
-        nodes, probs = zip(*next_states)
-        demands = [SCENARIO_DEMANDS[n] for n in nodes]
-
+        nodes, probabilities = zip(*next_states)
+        
         if mode == 'highest':
-            chosen_node = nodes[int(np.argmax(demands))]
-        elif mode == 'random':
-            chosen_node = np.random.choice(nodes, p=probs)
-        else:  # 'hybrid'
-            p = np.array(probs, dtype=float)
-            d = np.array(demands, dtype=float)
-
-            # 归一化（避免尺度问题）
-            def _norm(v):
-                v = np.array(v, dtype=float)
-                if v.ptp() < 1e-9:  # 全相等
-                    return np.zeros_like(v)
-                return (v - v.min()) / (v.max() - v.min())
-
-            p_norm = _norm(p)
-            d_norm = _norm(d)
-
-            # 平滑惩罚：与上一年差距越大，惩罚越大
-            if prev_demand is None or prev_demand <= 0:
-                jump_norm = np.zeros_like(d)
-            else:
-                jump = np.abs(d - prev_demand) / prev_demand
-                jump_norm = jump / (jump.max() + 1e-9)
-
-            # 综合评分
-            score = alpha * d_norm + beta * p_norm - smooth * jump_norm
-
-            # softmax 随机选择（温度越小越“贪心”）
-            q = _softmax(score, t=max(1e-6, temp))
-            chosen_node = np.random.choice(nodes, p=q)
-
-        chosen_demand = SCENARIO_DEMANDS[chosen_node]
-        annual_demands.append(chosen_demand)
-        prev_demand = chosen_demand
+            # Deterministic: Find the next node that has the maximum possible demand value
+            chosen_node = max(nodes, key=lambda node: SCENARIO_DEMANDS[node])
+        else: # Default to 'random'
+            # Probabilistic: Choose the next node based on given probabilities
+            chosen_node = np.random.choice(nodes, p=probabilities)
+            
+        annual_demands.append(SCENARIO_DEMANDS[chosen_node])
         current_node = chosen_node
-
+        
     return annual_demands
+
+### MODIFIED FUNCTION ###
 def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> list[dict]:
+    """
+    Generates all package details for a single day based on Casework logic.
+    - desired_deposit is sampled from total deposit distribution 
+    - desired_pickup is sampled conditionally based on deposit hour d 
+    - real_deposit includes offset and is bounded by desired_pickup 
+    - real_pickup includes an offset (original code's assumption)
+    """
     if num_packages <= 0: return []
     package_list = []
+    
+    # --- Generate Desired Deposit Times (Unchanged) ---
     required_sizes = np.random.choice(SIZES, size=num_packages, p=SIZE_PROBS)
+    # Sample deposit hour 'd' from the "Total" column distribution 
     deposit_hours = np.random.choice(24, size=num_packages, p=DEPOSIT_HOUR_PROBS)
     hourly_deposit_counts = pd.Series(deposit_hours).value_counts().to_dict()
+    
     all_deposit_datetimes = []
     for hour, count in hourly_deposit_counts.items():
         arrival_minutes = _generate_intra_hour_arrival_minutes(count)
@@ -149,25 +163,56 @@ def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> li
             base_time = datetime.datetime.combine(date, datetime.time(hour=hour))
             all_deposit_datetimes.append(base_time + datetime.timedelta(minutes=minute))
     random.shuffle(all_deposit_datetimes)
-    pickup_hours = np.random.choice(24, size=num_packages, p=PICKUP_HOUR_PROBS)
-    hourly_pickup_counts = pd.Series(pickup_hours).value_counts().to_dict()
-    all_pickup_minutes = []
-    for hour, count in hourly_pickup_counts.items():
-        arrival_minutes = np.random.uniform(0, 60, count)
-        for minute in arrival_minutes: all_pickup_minutes.append((hour, minute))
-    random.shuffle(all_pickup_minutes)
+    
+    # --- DELETED: Independent pickup time generation ---
+    # The incorrect logic that sampled pickup_hour independently has been removed.
+    
+    # --- MODIFIED: Loop and generate all times package by package ---
     for i in range(num_packages):
+        
+        # 1. Get the Desired Deposit Time
         desired_deposit_dt = all_deposit_datetimes[i]
-        pickup_hour, pickup_minute = all_pickup_minutes[i]
+        
+        # 2. Generate Desired Pickup Time (Based on Casework Table 3 logic)
+        deposit_hour_d = desired_deposit_dt.hour
+        
+        # Get the conditional probability row P(p|d) from the matrix 
+        conditional_probs = CONDITIONAL_PICKUP_PROBS_MATRIX[deposit_hour_d]
+        
+        # Sample the pickup hour 'p' based on P(p|d)
+        pickup_hour_p = np.random.choice(24, p=conditional_probs)
+        pickup_minute = np.random.uniform(0, 60) # Generate minute on the fly
+        
         pickup_date = desired_deposit_dt.date()
-        if pickup_hour < desired_deposit_dt.hour: pickup_date += datetime.timedelta(days=1)
-        base_pickup_time = datetime.datetime.combine(pickup_date, datetime.time(hour=pickup_hour))
+        
+        # Apply next-day rule if pickup hour is earlier than deposit hour
+        if pickup_hour_p < deposit_hour_d: 
+            pickup_date += datetime.timedelta(days=1)
+            
+        base_pickup_time = datetime.datetime.combine(pickup_date, datetime.time(hour=pickup_hour_p))
         desired_pickup_dt = base_pickup_time + datetime.timedelta(minutes=pickup_minute)
-        deposit_offset_hours = random.uniform(-1.5, 180.0)
-        pickup_offset_hours = random.uniform(-6.0, 6.0)
-        real_deposit_dt = desired_deposit_dt + datetime.timedelta(hours=deposit_offset_hours)
-        if real_deposit_dt >= desired_pickup_dt: real_deposit_dt = desired_pickup_dt - datetime.timedelta(hours=1)
+
+        # 3. Generate Real Deposit and Pickup Times (Logic Unchanged, but now uses correct desired_pickup_dt)
+        
+        # Deviation for deposit: [-1.5h, 180h] 
+        deposit_offset_hours = random.uniform(-1.5, 180.0) 
+        # Deviation for pickup: [-6h, 6h] (This was the assumption in the original code)
+        pickup_offset_hours = random.uniform(-6.0, 6.0) 
+        
+        # Calculate Real Deposit Time, with bounding 
+        potential_real_deposit_dt = desired_deposit_dt + datetime.timedelta(hours=deposit_offset_hours)
+        
+        # Apply the bound: "bounded to be before the demanded pickup time" 
+        # We use a 1-hour buffer as in the original code's logic.
+        if potential_real_deposit_dt >= desired_pickup_dt: 
+            real_deposit_dt = desired_pickup_dt - datetime.timedelta(hours=1) 
+        else:
+            real_deposit_dt = potential_real_deposit_dt
+            
+        # Calculate Real Pickup Time
         real_pickup_dt = desired_pickup_dt + datetime.timedelta(hours=pickup_offset_hours)
+
+        # 4. Append the package
         package_list.append({'min_size_ft3': required_sizes[i], 'desired_deposit_dt': desired_deposit_dt,
                              'desired_pickup_dt': desired_pickup_dt, 'real_deposit_dt': real_deposit_dt,
                              'real_pickup_dt': real_pickup_dt})
@@ -201,7 +246,7 @@ def generate_five_year_demand_instance(simulation_mode: str = 'random') -> pd.Da
     daily_demand_df['year'] = daily_demand_df['date'].dt.year
     daily_demand_df['period'] = ((daily_demand_df['date'].dt.dayofyear - 1) // 28) + 1
     daily_demand_df['period'] = daily_demand_df['period'].clip(upper=13)
-    daily_demand_df['day_of_week'] = daily_demand_df['date'].dt.dayofweek
+    daily_demand_df['day_of_week'] = daily_demand_df['date'].dt.dayofweek # 0=Monday, 6=Sunday
     
     all_years_dfs = []
     for year_idx, total_annual_demand in enumerate(annual_demands):
@@ -220,7 +265,8 @@ def generate_five_year_demand_instance(simulation_mode: str = 'random') -> pd.Da
 
             if len(period_df) > 0:
                 mean_daily_for_period = simulated_period_demand / len(period_df)
-                period_df['dow_share'] = period_df['day_of_week'].map(DAY_OF_WEEK_SHARE)
+                # Map DOW based on code's 0=Mon logic
+                period_df['dow_share'] = period_df['day_of_week'].map(DAY_OF_WEEK_SHARE_FROM_PDF)
                 avg_dow_share_in_period = period_df['dow_share'].mean()
                 
                 period_df['expected_daily'] = mean_daily_for_period * (period_df['dow_share'] / avg_dow_share_in_period)
@@ -239,9 +285,11 @@ def generate_five_year_demand_instance(simulation_mode: str = 'random') -> pd.Da
                 remainder = simulated_period_demand - period_df['final_daily_demand'].sum()
                 if remainder > 0:
                     demand_values = period_df['final_daily_demand'].values
-                    add_indices = np.random.choice(demand_values.size, size=int(remainder), replace=True)
-                    np.add.at(demand_values, add_indices, 1)
-                    period_df['final_daily_demand'] = demand_values
+                    # Ensure we don't try to choose from an empty array if size is 0
+                    if demand_values.size > 0:
+                        add_indices = np.random.choice(demand_values.size, size=int(remainder), replace=True)
+                        np.add.at(demand_values, add_indices, 1)
+                        period_df['final_daily_demand'] = demand_values
             else:
                  period_df['final_daily_demand'] = 0
 
@@ -260,6 +308,7 @@ def generate_five_year_demand_instance(simulation_mode: str = 'random') -> pd.Da
     for _, row in tqdm(final_demand_schedule.iterrows(), total=len(final_demand_schedule), desc="Daily Progress"):
         num_packages_today = row['final_daily_demand']
         if num_packages_today > 0:
+            # This now calls the MODIFIED function
             packages_today = _generate_packages_for_one_day(int(num_packages_today), row['date'].date())
             all_packages.extend(packages_today)
             
@@ -330,7 +379,7 @@ if __name__ == '__main__':
         fig_path = os.path.join(figs_dir, "06_daily_counts_roll28.png")
         plt.tight_layout()
         plt.savefig(fig_path, dpi=150)
-        plt.show()
+        # plt.show() # Commented out to prevent blocking in script
         print(f"Saved: {fig_path}")
 
         print(f"\n✅ Figures for this run saved under: {figs_dir}")
