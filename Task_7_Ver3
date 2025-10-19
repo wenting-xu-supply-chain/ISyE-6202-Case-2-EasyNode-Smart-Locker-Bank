@@ -53,7 +53,7 @@ np.random.seed(RANDOM_SEED)
 R_D = {'small': 6.10, 'medium': 11.95, 'large': 16.35}
 
 # Locker hardware cost per size (c^L_d), per installed locker
-C_L = {'small': 700.0, 'medium': 1100.0, 'large': 1600.0}
+C_L = {'small': 91.0, 'medium': 182.0, 'large': 273.0}
 
 # Interactive module cost (c^M), width cost (c^W), surface cost (c^S)
 C_M = 50.0           # cost per interactive module
@@ -280,7 +280,7 @@ XI_UNDERUTIL = 4e5
 TARGET_VOL_UTIL = 0.72
 
 MAX_ITERS, NO_IMPROVE_PATIENCE = 60, 6
-T7_SAMPLE_SIZE = 12_000
+T7_SAMPLE_SIZE = 12000
 
 MOVE_SET_R1 = [(+1,-1,0), (-1,+1,0), (+1,0,-1), (-1,0,+1), (0,+1,-1), (0,-1,+1)]
 MOVE_SET_R2 = [(+2,-1,-1), (-2,+1,+1), (+1,+1,-2), (-1,-1,+2), (+1,-2,+1), (-1,+2,-1)]
@@ -364,21 +364,25 @@ def run_task7():
     best_cfg, best_kpi, traj = _search(df, baseline_cfg)
     best_obj = _objective(best_kpi)  # FIX: 只传 kpi
 
+    base_profit = base_kpi['revenue'] - base_kpi['total_cost']
+    best_profit = best_kpi['revenue'] - best_kpi['total_cost']
+
     comp = pd.DataFrame([
         ['Baseline', *baseline_cfg.values(),
-         base_kpi['overall_sl'], base_kpi['revenue'], base_kpi['ergonomic_cost'],
-         base_kpi['capex_amort'], base_kpi['total_cost'], base_kpi['vol_util_overall'],
-         base_kpi['oversize_rate'], base_kpi['width'], base_kpi['height'], base_obj],
+        base_kpi['overall_sl'], base_kpi['revenue'], base_kpi['ergonomic_cost'],
+        base_kpi['capex_amort'], base_kpi['total_cost'], base_profit,   # <-- profit
+        base_kpi['vol_util_overall'], base_kpi['oversize_rate'],
+        base_kpi['width'], base_kpi['height'], base_obj],
         ['Recommended', *best_cfg.values(),
-         best_kpi['overall_sl'], best_kpi['revenue'], best_kpi['ergonomic_cost'],
-         best_kpi['capex_amort'], best_kpi['total_cost'], best_kpi['vol_util_overall'],
-         best_kpi['oversize_rate'], best_kpi['width'], best_kpi['height'], best_obj]
+        best_kpi['overall_sl'], best_kpi['revenue'], best_kpi['ergonomic_cost'],
+        best_kpi['capex_amort'], best_kpi['total_cost'], best_profit,   # <-- profit
+        best_kpi['vol_util_overall'], best_kpi['oversize_rate'],
+        best_kpi['width'], best_kpi['height'], best_obj]
     ], columns=[
         'Design','Small','Medium','Large',
-        'SL','Revenue','ErgoCost','Capex_Amort','TotalCost','VolUtil',
-        'OversizeRate','W','H','Objective'
+        'SL','Revenue','ErgoCost','Capex_Amort','TotalCost','Profit',    # <-- Profit
+        'VolUtil','OversizeRate','W','H','Objective'
     ])
-
     comp.to_csv(os.path.join(OUT_DIR, "task7_comparison.csv"), index=False)
     traj.to_csv(os.path.join(OUT_DIR, "task7_search_traj.csv"), index=False)
     generate_layout_report(best_cfg, os.path.join(OUT_DIR, "task7_recommended_layout.csv"))
