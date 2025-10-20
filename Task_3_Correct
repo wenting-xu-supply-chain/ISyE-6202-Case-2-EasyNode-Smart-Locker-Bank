@@ -1,401 +1,611 @@
-# -*- coding: utf-8 -*-
-"""
-Task 5/6 - Locker Bank Operation Simulator (CORRECTED)
-Last Update: 2025-10-20
-
-FIXES Applied:
-- AMORT_LAMBDA corrected to 1.0.
-- Booking duration logic fixed: Lockers are booked based on actual sojourn times.
-- Late fee calculation corrected based on casework description (actual vs desired pickup relative to planned duration).
-"""
-
-import os, math, warnings, bisect
-import numpy as np
 import pandas as pd
+import numpy as np
+import datetime
+import random
 from tqdm import tqdm
-from joblib import Parallel, delayed
+import os
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
-warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
+# =============================================================================
+# --- Section 1: Constants from Casework Document and New Logic ---
+# =============================================================================
+# Demand variability
+PERIOD_CV = 0.2
+DAILY_DEMAND_CV = 0.25
 
-# =========================
-# Global Parameters
-# =========================
-# Ensure Task 3 output includes desired_deposit_dt and desired_pickup_dt
-INPUT_DEMAND_CSV = "Task_3_Outcome/task3_demand_instance_random_mode.csv"
-OUT_DIR = "Task_5_Outcome"
-os.makedirs(OUT_DIR, exist_ok=True)
+# Time variability (Casework Page 3-4)
+DEPOSIT_OFFSET_MIN = -1.5  # 90 minutes early (Used for DD -> RD)
+DEPOSIT_OFFSET_MAX = 180.0 # 180 hours late (Used for DD -> RD)
 
-GRID_HEIGHT = 15
-ROW_HEIGHT_CM = 10
-BASE_FLOOR_TO_ROW0_CM = 30
-SIZE_UNITS = {'small': 1, 'medium': 2, 'large': 3}
-LOCKER_CAPACITY_FT3 = {'small': 3.0, 'medium': 9.0, 'large': 18.0}
-USER_HEIGHT_DIST_CM = {'p50': 170}
-ARM_REACH_OFFSET_CM = 70
-REACH_SAFETY_MARGIN_CM = 10
+# New Logic: Fixed window for Desired Pickup (RD -> DP)
+FIXED_DESIRED_WINDOW = datetime.timedelta(hours=5)
 
-# Task 5 Fee Model
-BASE_FEE = 5.0
-SIZE_UPCHARGE = {'small': 0.0, 'medium': 1.5, 'large': 3.0}
-LATE_FEE_STEP = 0.20 # 20% surcharge per 20% extension
+# Minimum time a package must stay in the locker (Safety check if RD and RP are in the same hour)
+MINIMUM_SOJOURN = datetime.timedelta(minutes=5)
 
-# Smarter Heuristic Parameters
-LOOKAHEAD_HOURS = 48
-SIZE_PROTECTION_LARGE_THRESHOLD = 0.15
-OVERSIZE_OPPORTUNITY_COST_PER_LEVEL = 4.0
 
-RANDOM_SEED = 20251010
-np.random.seed(RANDOM_SEED)
+# Table 1: Package Size Probability
+SIZE_PROBABILITY = {
+    1: 0.08, 2: 0.12, 3: 0.15, 4: 0.12, 5: 0.08, 6: 0.06, 7: 0.05,
+    8: 0.05, 9: 0.05, 10: 0.04, 11: 0.04, 12: 0.03, 13: 0.03,
+    14: 0.03, 15: 0.02, 16: 0.02, 17: 0.02, 18: 0.01
+}
+SIZES = list(SIZE_PROBABILITY.keys())
+SIZE_PROBS = list(SIZE_PROBABILITY.values())
 
-# Baseline Configuration
-NUM_SMALL = 60
-NUM_MEDIUM = 71
-NUM_LARGE = 41
+# Table 2: 4-week period demand share
+PERIOD_DEMAND_SHARE = {
+    1: 0.03, 2: 0.05, 3: 0.06, 4: 0.07, 5: 0.11, 6: 0.06, 7: 0.04,
+    8: 0.10, 9: 0.10, 10: 0.06, 11: 0.08, 12: 0.11, 13: 0.13
+}
 
-SLA_DAILY_TARGET = 0.995
-WARMUP_DAYS = 2.0
+# Table 2: Day of week demand share (Assuming 0=Monday, 6=Sunday)
+DAY_OF_WEEK_SHARE_FROM_PDF = {
+    0: 0.13, 1: 0.12, 2: 0.15, 3: 0.18, 4: 0.20, 5: 0.15, 6: 0.07
+}
 
-# ==========================================================
-# --- Task 7 Economic & Objective Parameters ---
-# ==========================================================
-R_D = {'small': 6.10, 'medium': 11.95, 'large': 16.35}
-C_L = {'small': 91.0, 'medium': 182.0, 'large': 273.0}
-C_M = 50.0; C_W = 500.0; C_S = 50.0
-# FIX: Amortization factor set to 1.0.
-AMORT_LAMBDA = 1.0
-N_M_COVER = 14
+# Figure 1: Scenario Tree
+SCENARIO_TREE = {
+    'start': [('1.1', 0.25), ('1.2', 0.25), ('1.3', 0.5)], '1.1': [('2.1', 0.3), ('2.2', 0.4), ('2.3', 0.3)],
+    '1.2': [('2.2', 0.6), ('2.3', 0.4)], '1.3': [('2.4', 0.6), ('2.5', 0.4)], '2.1': [('3.1', 0.5), ('3.2', 0.5)],
+    '2.2': [('3.1', 0.3), ('3.2', 0.4), ('3.3', 0.3)], '2.3': [('3.2', 0.6), ('3.3', 0.4)],
+    '2.4': [('3.4', 0.6), ('3.5', 0.4)], '2.5': [('3.4', 0.4), ('3.5', 0.6)], '3.1': [('4.1', 0.5), ('4.2', 0.5)],
+    '3.2': [('4.1', 0.3), ('4.2', 0.4), ('4.3', 0.3)], '3.3': [('4.2', 0.6), ('4.3', 0.4)],
+    '3.4': [('4.3', 0.1), ('4.4', 0.6), ('4.5', 0.3)], '3.5': [('4.4', 0.4), ('4.5', 0.6)],
+    '4.1': [('5.1', 0.5), ('5.2', 0.5)], '4.2': [('5.1', 0.3), ('5.2', 0.4), ('5.3', 0.3)],
+    '4.3': [('5.2', 0.6), ('5.3', 0.4)], '4.4': [('5.3', 0.25), ('5.4', 0.75)], '4.5': [('5.4', 0.4), ('5.5', 0.6)]
+}
+SCENARIO_DEMANDS = {
+    '1.1': 50000, '1.2': 60000, '1.3': 80000, '2.1': 60000, '2.2': 65000, '2.3': 70000, '2.4': 90000, '2.5': 100000,
+    '3.1': 60000, '3.2': 70000, '3.3': 75000, '3.4': 100000, '3.5': 110000, '4.1': 60000, '4.2': 75000, '4.3': 80000,
+    '4.4': 105000, '4.5': 120000, '5.1': 60000, '5.2': 65000, '5.3': 90000, '5.4': 110000, '5.5': 150000
+}
 
-# Objective Function Penalties
-LAMBDA_SLA = 3e7; MU_OVERSIZE = 1e6; XI_UNDERUTIL = 4e5
-TARGET_VOL_UTIL = 0.72
+# Table 3: Deposit-Pickup Matrix (Probability x 10,000)
+DEPOSIT_PICKUP_MATRIX = np.array([
+    [30, 20, 4, 4, 4, 10, 20, 24, 32, 20, 12, 12, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 24, 12, 6, 4, 10, 20, 24, 32, 20, 16, 12, 12, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 12, 6, 3, 5, 10, 12, 16, 10, 8, 6, 6, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 12, 6, 3, 10, 12, 16, 10, 8, 6, 6, 4, 4, 3, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 36, 24, 30, 36, 48, 30, 24, 18, 18, 15, 12, 9, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 36, 45, 45, 48, 30, 24, 18, 18, 15, 12, 9, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 60, 60, 72, 44, 32, 24, 24, 20, 16, 16, 20, 12, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 72, 100, 48, 32, 24, 24, 20, 16, 16, 20, 16, 12, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 150, 120, 60, 48, 48, 36, 24, 24, 30, 24, 18, 18, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 96, 90, 60, 36, 24, 24, 36, 42, 30, 18, 12, 12, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 90, 108, 108, 90, 30, 24, 36, 42, 30, 18, 12, 12, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 138, 90, 48, 36, 36, 48, 30, 18, 12, 12, 12, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 80, 100, 40, 32, 32, 40, 40, 12, 8, 8, 4, 4],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 108, 60, 48, 60, 60, 60, 36, 24, 18, 6],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 160, 144, 112, 112, 80, 80, 48, 32, 24, 8],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 120, 120, 90, 66, 36, 24, 18, 6],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 150, 120, 90, 48, 36, 24, 12],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 120, 180, 120, 84, 60, 24, 12],
+    [0, 0, 0, 0, 0, 0, 10, 40, 20, 10, 0, 0, 0, 0, 0, 0, 0, 0, 100, 120, 100, 70, 20, 10],
+    [5, 0, 0, 0, 0, 0, 15, 50, 40, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, 150, 75, 35, 15],
+    [8, 0, 0, 0, 0, 0, 20, 60, 40, 12, 8, 8, 4, 0, 0, 0, 0, 0, 0, 0, 80, 100, 40, 20],
+    [10, 4, 0, 0, 0, 0, 12, 36, 30, 8, 4, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 30, 40, 20],
+    [20, 10, 4, 0, 0, 0, 12, 36, 30, 8, 4, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30, 40],
+    [30, 14, 6, 0, 0, 0, 16, 40, 36, 16, 6, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30]
+], dtype=float)
 
-# =========================
-# Utility Functions
-# =========================
-def get_ergonomic_cost(req_size_cat, assigned_size_cat, y_pos):
-    y = y_pos + 1; cost = 0.0; size_map = {'small': 1, 'medium': 2, 'large': 3}
-    d_req, d_assigned = size_map.get(req_size_cat), size_map.get(assigned_size_cat)
-    if d_req is None or d_assigned is None or d_assigned < d_req: return float('inf')
-    if d_req == 1 and d_assigned == 1:   cost = 0.01 * (115 - 15*y) if y <= 7 else 0.01 * (-95 + 15*y)
-    elif d_req == 1 and d_assigned == 2: cost = 0.01 * ((75 + (65/6)) - (65/6)*y) if y <= 7 else 0.01 * (10 - 7*(65/6) + (65/6)*y)
-    elif d_req == 1 and d_assigned == 3: cost = 0.01 * ((50 + (40/6)) - (40/6)*y) if y <= 7 else 0.01 * (10 - 7*(40/6) + (40/6)*y)
-    elif d_req == 2 and d_assigned == 2: cost = 0.01 * ((10 - (65/14)) + (65/14)*y)
-    elif (d_req == 2 and d_assigned == 3) or (d_req == 3 and d_assigned == 3):
-        cost = 0.01 * ((10 - (90/14)) + (90/14)*y)
-    return max(0, cost)
+# Calculate Daily deposit distribution (Sum of the rows)
+# This distribution is used to generate the initial Desired Deposit Time (DD)
+DAILY_DEPOSIT_DIST = DEPOSIT_PICKUP_MATRIX.sum(axis=1)
+DEPOSIT_HOUR_PROBS = DAILY_DEPOSIT_DIST / DAILY_DEPOSIT_DIST.sum()
 
-def reachable_row_range_for_user():
-    h = np.random.normal(USER_HEIGHT_DIST_CM['p50'], 3.0)
-    reach_max_cm = h + ARM_REACH_OFFSET_CM - REACH_SAFETY_MARGIN_CM
-    reach_min_cm = max(0, h * 0.35)
-    max_row = min(GRID_HEIGHT - 1, int(round((reach_max_cm - BASE_FLOOR_TO_ROW0_CM) / ROW_HEIGHT_CM)))
-    min_row = max(0, int(round((reach_min_cm - BASE_FLOOR_TO_ROW0_CM) / ROW_HEIGHT_CM)))
-    return (min_row, max_row) if min_row <= max_row else (0, GRID_HEIGHT - 1)
+# Calculate conditional probabilities P(p|d)
+# This matrix is used to generate Real Pickup Time (RP) based on Real Deposit Time (RD)
+row_sums_d = DAILY_DEPOSIT_DIST.reshape(-1, 1)
+CONDITIONAL_PICKUP_PROBS_MATRIX = np.divide(
+    DEPOSIT_PICKUP_MATRIX,
+    row_sums_d,
+    out=np.zeros_like(DEPOSIT_PICKUP_MATRIX),
+    where=row_sums_d!=0
+)
 
-def _objective(kpi: dict) -> float:
-    score = float(kpi['revenue'] - kpi['total_cost'])
-    if kpi['overall_sl'] < SLA_DAILY_TARGET:
-        score -= LAMBDA_SLA * (SLA_DAILY_TARGET - kpi['overall_sl'])
-    score -= MU_OVERSIZE * float(kpi.get('oversize_rate', 0.0))
-    util_gap = max(0.0, TARGET_VOL_UTIL - float(kpi.get('vol_util_overall', 0.0)))
-    score -= XI_UNDERUTIL * util_gap
-    return score
+START_YEAR = 2026
 
-# =========================
-# Data Structures
-# =========================
-class Locker:
-    # (Unchanged)
-    def __init__(self, locker_id, size_category, position_rc):
-        self.id, self.size, self.position, self.schedule = locker_id, size_category, position_rc, []
-    def is_available(self, start, end):
-        if not self.schedule: return True
-        idx = bisect.bisect_right(self.schedule, (start, start))
-        if idx > 0 and self.schedule[idx - 1][1] > start: return False
-        if idx < len(self.schedule) and self.schedule[idx][0] < end: return False
-        return True
-    def book(self, start, end): bisect.insort(self.schedule, (start, end))
 
-class LockerBank:
-    # (Unchanged)
-    def __init__(self, num_s, num_m, num_l, height=GRID_HEIGHT):
-        self.height = height
-        self.lockers = []
-        self._create_layout(num_s, num_m, num_l)
-        self.width = (max((L.position[1] for L in self.lockers), default=-1) + 1)
-        self.num_config = {'small': num_s, 'medium': num_m, 'large': num_l}
+# =============================================================================
+# --- Section 2: Helper Functions ---
+# =============================================================================
 
-    def _create_layout(self, num_s, num_m, num_l):
-        # Basic stacking layout
-        specs = [('small', num_s), ('medium', num_m), ('large', num_l)]
-        current_row, current_col, lid = 0, 0, 0
-        for size, cnt in specs:
-            h_units = SIZE_UNITS[size]
-            for _ in range(cnt):
-                if current_row + h_units > self.height: current_row, current_col = 0, current_col + 1
-                center_row = current_row + (h_units - 1) / 2.0
-                self.lockers.append(Locker(lid, size, (int(round(center_row)), current_col)))
-                current_row += h_units; lid += 1
+def _generate_intra_hour_arrival_minutes(N, lsp_proportion=0.8, lsp_mean=15, lsp_std=5):
+    """
+    Generates arrival minutes within an hour (Task 2 logic).
+    LSPs tend to arrive earlier, Customers are uniform.
+    """
+    if N <= 0: return []
+    n_lsp = int(round(N * lsp_proportion))
+    n_cust = N - n_lsp
+    
+    # LSP arrivals (Normal distribution, centered early, clipped 0-60)
+    lsp_times = np.clip(np.random.normal(loc=lsp_mean, scale=lsp_std, size=n_lsp), 0, 59.99)
+    # Customer arrivals (Uniform distribution)
+    cust_times = np.random.uniform(0, 59.99, n_cust)
+    
+    all_times = np.concatenate((lsp_times, cust_times))
+    all_times.sort()
+    return list(all_times)
 
-class AssignmentAgent:
-    def __init__(self, locker_bank: LockerBank):
-        self.lb = locker_bank; self._build_req_size_map()
-        self.total_large = sum(1 for L in self.lb.lockers if L.size == 'large')
 
-    def _build_req_size_map(self):
-        m = {}; [m.update({s: 'small'}) for s in range(1, 4)]; [m.update({s: 'medium'}) for s in range(4, 10)]; [m.update({s: 'large'}) for s in range(10, 19)]
-        self.req_size_map = m
-    @staticmethod
-    def _size_value(cat): return {'small': 1, 'medium': 2, 'large': 3}.get(cat, 0)
-
-    def _get_candidates(self, req_cat, start, end, rr):
-        req_v = self._size_value(req_cat)
-        return [L for L in self.lb.lockers if self._size_value(L.size) >= req_v and (rr[0] <= L.position[0] <= rr[1]) and L.is_available(start, end)]
-
-    # --- FIX: Corrected Fee and Cost Calculation Logic ---
-    # Renamed from _apply_policy_and_price and logic updated
-    def _calculate_fees_and_costs(self, actual_start, actual_end, desired_start, desired_end, assigned_size, req_size, locker_position_row=0):
-        """
-        Calculates fees based on Casework rules (T5 model) and ergonomic costs (T7 model).
-        """
-        # T5 Fee Model
-        base = BASE_FEE
-        upc = SIZE_UPCHARGE.get(assigned_size, 0.0)
-
-        # Late Fee Calculation (Casework Rule: 20% surcharge per 20% extension beyond stated pickup time)
-        late_fee = 0.0
-        if actual_end > desired_end:
-            planned_duration = (desired_end - desired_start).total_seconds()
-            if planned_duration > 0:
-                extension_seconds = (actual_end - desired_end).total_seconds()
-                extension_ratio = extension_seconds / planned_duration
-
-                # Calculate steps of 20% extension (ceiling function implied by casework)
-                surcharge_steps = math.ceil(extension_ratio / LATE_FEE_STEP)
-                late_fee = surcharge_steps * LATE_FEE_STEP * base
-
-        # T7 Ergonomic Cost
-        ergo_cost = get_ergonomic_cost(req_size, assigned_size, locker_position_row)
-
-        return base, upc, late_fee, ergo_cost
-
-    # (Heuristics Logic Unchanged)
-    def assign_t5_strawman(self, req_cat, start, end, rr):
-        cands = self._get_candidates(req_cat, start, end, rr)
-        cands.sort(key=lambda L: (self._size_value(L.size) - self._size_value(req_cat), L.position[1], abs(L.position[0] - GRID_HEIGHT//2)))
-        return cands[0] if cands else None
-
-    def assign_t5_smarter(self, req_cat, start, end, rr):
-        cands = self._get_candidates(req_cat, start, end, rr)
-        if not cands: return None
-        # Proxy for utilization at time 'start'
-        num_large_used = sum(1 for L in self.lb.lockers if L.size == 'large' and L.schedule and L.schedule[-1][1] > start)
-        large_remain_ratio = (self.total_large - num_large_used) / self.total_large if self.total_large > 0 else 0
-        return max(cands, key=lambda L: self._smarter_score(L, req_cat, start, end, large_remain_ratio))
-
-    def _smarter_score(self, locker: Locker, req_cat, start, end, large_remain_ratio):
-        # (Scoring logic unchanged)
-        req_v, size_diff = self._size_value(req_cat), self._size_value(locker.size) - self._size_value(req_cat)
-        size_score = 1.0 / (1 + 2.0 * max(0, size_diff))
-        ergo_soft = 1.0 - min(1.0, abs(locker.position[0] - GRID_HEIGHT/2) / (GRID_HEIGHT/2)) * 0.6
-        next_start = float('inf')
-        idx = bisect.bisect_right(locker.schedule, (end, end))
-        if idx < len(locker.schedule):
-            next_start = locker.schedule[idx][0]
-        future = 1.0 if next_start == float('inf') else max(0.0, min(1.0, (next_start - end).total_seconds()/3600 / LOOKAHEAD_HOURS))
-        protect_penalty = 0.0
-        if locker.size == 'large' and size_diff > 0:
-            if large_remain_ratio < SIZE_PROTECTION_LARGE_THRESHOLD:
-                protect_penalty = (SIZE_PROTECTION_LARGE_THRESHOLD - large_remain_ratio) * 0.8
-        return (0.40 * size_score) + (0.30 * ergo_soft) + (0.30 * future) - protect_penalty
-
-class LockerBankSimulator:
-    def __init__(self, locker_bank: LockerBank, demand_df: pd.DataFrame, agent: AssignmentAgent, heuristic='smarter', warmup_days=WARMUP_DAYS, position=0):
-        self.lb = locker_bank; self.demand = demand_df.copy(); self.agent = agent
-        self.heuristic = heuristic; self.warmup_days = warmup_days
-        self.results = pd.DataFrame(); self.position = position
-
-    def _req_category(self, v_ft3):
-        v = int(math.ceil(float(v_ft3))) if pd.notna(v_ft3) else 1
-        return self.agent.req_size_map.get(max(1, min(18, v)), 'large')
-
-    # --- FIX: Corrected Simulation Run Logic ---
-    def run(self):
-        start_ts = self.demand['real_deposit_dt'].min(); warmup_cut = start_ts + pd.Timedelta(days=self.warmup_days)
-
-        # FIX: Ensure all necessary columns (desired and actual) are included
-        required_cols = ['package_id', 'min_size_ft3', 'real_deposit_dt', 'real_pickup_dt', 'desired_deposit_dt', 'desired_pickup_dt']
-        if not all(col in self.demand.columns for col in required_cols):
-             raise ValueError(f"Demand data must contain columns: {required_cols}")
-
-        demand_array = self.demand[required_cols].to_numpy()
-        rows = []
-        progress_bar = tqdm(demand_array, desc=f"Sim ({self.heuristic})".ljust(30), position=self.position, ncols=100)
-
-        for r_data in progress_bar:
-            # FIX: Process both actual (real) and desired times
-            pkg, min_size_ft3, actual_start_dt, actual_end_dt, desired_start_dt, desired_end_dt = r_data
-
-            # Use actual times for simulation/booking
-            actual_start, actual_end = pd.to_datetime(actual_start_dt), pd.to_datetime(actual_end_dt)
-            # Use desired times for cost/fee comparison
-            desired_start, desired_end = pd.to_datetime(desired_start_dt), pd.to_datetime(desired_end_dt)
-
-            req_cat = self._req_category(min_size_ft3)
-            rr = reachable_row_range_for_user()
-
-            chosen = None
-            # Assignment heuristics use actual times for availability check
-            if self.heuristic == 't5_strawman': chosen = self.agent.assign_t5_strawman(req_cat, actual_start, actual_end, rr)
-            elif self.heuristic == 't5_smarter': chosen = self.agent.assign_t5_smarter(req_cat, actual_start, actual_end, rr)
-
-            row = {'package_id': pkg, 'required_size': req_cat, 'package_volume_ft3': min_size_ft3,
-                   'status': 'rejected', 'assigned_locker_size': None,
-                   'real_start': pd.NaT, 'real_end': pd.NaT, 'revenue_base': 0.0,
-                   'revenue_size_upcharge': 0.0, 'revenue_late_fee': 0.0, 'date': actual_start.date(),
-                   'keep_for_eval': actual_start >= warmup_cut, 'ergonomic_cost': 0.0}
-
-            if chosen:
-                # Calculate costs and fees
-                base, upc, late, ergo_cost = self.agent._calculate_fees_and_costs(
-                    actual_start, actual_end, desired_start, desired_end, chosen.size, req_cat, chosen.position[0]
-                )
-
-                # CRITICAL FIX: Book the locker using the ACTUAL times
-                chosen.book(actual_start, actual_end)
-
-                row.update({'status': 'accepted', 'assigned_locker_size': chosen.size,
-                            'real_start': actual_start, 'real_end': actual_end,
-                            'revenue_base': base, 'revenue_size_upcharge': upc, 'revenue_late_fee': late, 'ergonomic_cost': ergo_cost})
-            rows.append(row)
-
-        self.results = pd.DataFrame(rows)
-
-    def summarize(self, tag: str):
-        # (Summarize function logic is robust and correctly integrates T5/T7 KPIs based on results)
-        eval_df = self.results[self.results['keep_for_eval']]
-        if eval_df.empty:
-            print(f"[{tag}] --- NO DATA FOR EVALUATION ---")
-            return "--- NO DATA FOR EVALUATION ---"
-
-        # --- 1. T5/T6 KPI Calculations ---
-        daily_sl = eval_df.groupby('date')['status'].apply(lambda s: (s == 'accepted').mean()).reset_index(name='service_level')
-        overall_sl_t5 = (eval_df['status']=='accepted').mean()
-        min_daily_sl = daily_sl['service_level'].min() if not daily_sl.empty else 0
-        breach_days = (daily_sl['service_level'] < SLA_DAILY_TARGET).sum() if not daily_sl.empty else 0
-        total_fee_revenue = eval_df[['revenue_base', 'revenue_size_upcharge', 'revenue_late_fee']].sum().sum()
+def _simulate_annual_demand_path(mode='random') -> list[int]:
+    """Simulates a 5-year demand path through the scenario tree (Figure 1)."""
+    annual_demands = []
+    current_node = 'start'
+    for _ in range(5):
+        next_states = SCENARIO_TREE.get(current_node)
+        if not next_states: break
+            
+        nodes, probabilities = zip(*next_states)
         
-        # Volume Utilization
-        df_success = eval_df[eval_df['status'] == 'accepted'].copy()
-        util_overall_t5 = 0.0
-        if not df_success.empty:
-            df_success['assigned_locker_capacity_ft3'] = df_success['assigned_locker_size'].map(LOCKER_CAPACITY_FT3)
-            total_pkg_vol_all = df_success['package_volume_ft3'].sum()
-            total_locker_cap_all = df_success['assigned_locker_capacity_ft3'].sum()
-            util_overall_t5 = total_pkg_vol_all / total_locker_cap_all if total_locker_cap_all > 0 else 0.0
-
-        # --- 2. T7 KPI Calculations ---
-        # Revenue (T7 Model)
-        served = eval_df[eval_df['status'] == 'accepted']
-        S_d = served.groupby('required_size').size().reindex(['small', 'medium', 'large'], fill_value=0)
-        revenue_t7 = float(sum(R_D[d] * S_d[d] for d in ['small', 'medium', 'large']))
+        if mode == 'highest':
+            chosen_node = max(nodes, key=lambda node: SCENARIO_DEMANDS.get(node, 0))
+        else: # Default to 'random'
+            chosen_node = np.random.choice(nodes, p=probabilities)
+            
+        annual_demands.append(SCENARIO_DEMANDS.get(chosen_node, 0))
+        current_node = chosen_node
         
-        # Cost (T7 Model)
-        ergo_cost_t7 = float(served['ergonomic_cost'].sum())
-        W = self.lb.width; H = self.lb.height
-        M = int(np.ceil(W / N_M_COVER)) if W > 0 else 0
-        cfg = self.lb.num_config
-        capex = sum(C_L[d] * cfg[d] for d in ['small', 'medium', 'large']) + C_M * M + C_W * W + 2.0 * C_S * (W + H)
-        # Uses the corrected AMORT_LAMBDA
-        capex_amort_t7 = AMORT_LAMBDA * capex
-        total_cost_t7 = ergo_cost_t7 + capex_amort_t7
-        profit_t7 = revenue_t7 - total_cost_t7
+    return annual_demands
+
+
+def _calculate_expected_annual_demands(tree: dict, demands: dict) -> list[int]:
+    """Calculates the weighted average (expected) demand for each of the 5 years."""
+    absolute_probs = {}
+    year_nodes = {y: [] for y in range(1, 6)}
+    
+    # Group nodes by year
+    for node_name in demands.keys():
+        try:
+            year = int(node_name.split('.')[0])
+            if year in year_nodes:
+                year_nodes[year].append(node_name)
+        except ValueError: continue
+
+    # Initialize Year 1
+    for next_node, prob in tree.get('start', []):
+        absolute_probs[next_node] = prob
+
+    # Propagate probabilities Years 2-5
+    for year in range(2, 6):
+        for node_name in year_nodes[year]:
+            absolute_probs[node_name] = 0.0
         
-        # Additional T7 Metrics
-        oversize_rate_t7 = float((served['assigned_locker_size'] != served['required_size']).mean()) if not served.empty else 0.0
-        vol_util_t7 = util_overall_t5
+        prev_year_nodes = year_nodes[year - 1]
+        for prev_node in prev_year_nodes:
+            prev_prob = absolute_probs.get(prev_node, 0)
+            if prev_prob == 0: continue
+            
+            next_states = tree.get(prev_node, [])
+            for next_node, conditional_prob in next_states:
+                if next_node in absolute_probs:
+                    absolute_probs[next_node] += prev_prob * conditional_prob
 
-        # --- 3. Calculate T7 Objective Score ---
-        kpi_dict = {
-            'overall_sl': overall_sl_t5, 'revenue': revenue_t7, 'total_cost': total_cost_t7,
-            'oversize_rate': oversize_rate_t7, 'vol_util_overall': vol_util_t7
-        }
-        objective_score = _objective(kpi_dict)
+    # Calculate expected demand
+    expected_annual_demands = []
+    for year in range(1, 6):
+        expected_demand_for_year = 0.0
+        if year in year_nodes and year_nodes[year]:
+            for node_name in year_nodes[year]:
+                prob = absolute_probs.get(node_name, 0)
+                demand = demands.get(node_name, 0)
+                expected_demand_for_year += prob * demand
+            expected_annual_demands.append(int(round(expected_demand_for_year)))
+        
+    return expected_annual_demands
 
-        # --- 4. Generate Combined Report ---
-        summary_text = (
-            f"\n--- {tag.upper()} SUMMARY ---\n"
-            f"  [T5 Metrics (Fee-Based)]\n"
-            f"  Overall Service Level: {overall_sl_t5:.3%}\n"
-            f"  Minimum Daily SL: {min_daily_sl:.3%}\n"
-            f"  Days Breaching SLA Target: {breach_days}\n"
-            f"  Total Revenue (Fee-Based): ${total_fee_revenue:,.2f}\n"
-            f"  Volume Utilization (Overall): {util_overall_t5:.2%}\n"
-            f"  ------------------------------------------\n"
-            f"  [T7 Metrics (Economics-Based)]\n"
-            f"  Revenue (T7 Model): ${revenue_t7:,.2f}\n"
-            f"  Total Cost (Ergo + Amort. CAPEX): ${total_cost_t7:,.2f}\n"
-            f"  PROFIT (T7 Model): ${profit_t7:,.2f}\n"
-            f"  Oversize Rate: {oversize_rate_t7:.2%}\n"
-            f"  ------------------------------------------\n"
-            f"  FINAL OBJECTIVE SCORE: {objective_score:,.2f}"
-        )
 
-        eval_df.to_csv(os.path.join(OUT_DIR, f"{tag}_results.csv"), index=False)
-        with open(os.path.join(OUT_DIR, f"{tag}_summary.txt"), 'w', encoding='utf-8') as f:
-            f.write(summary_text)
-        return summary_text
+def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> list[dict]:
+    """
+    Generates package details for a single day using the NEW requested logic.
+    Logic Flow: DD -> RD -> RP -> DP
+    """
+    if num_packages <= 0: return []
+    package_list = []
+    
+    # --- Setup: Generate Sizes and Initial Desired Deposit Times (DD) ---
+    required_sizes = np.random.choice(SIZES, size=num_packages, p=SIZE_PROBS)
+    
+    # Step 1: Generate Desired Deposit (DD) based on hourly probabilities
+    deposit_hours = np.random.choice(24, size=num_packages, p=DEPOSIT_HOUR_PROBS)
+    hourly_deposit_counts = pd.Series(deposit_hours).value_counts().to_dict()
+    
+    all_desired_deposit_datetimes = []
+    for hour, count in hourly_deposit_counts.items():
+        arrival_minutes = _generate_intra_hour_arrival_minutes(count)
+        for minute in arrival_minutes:
+            try:
+                # Create the datetime object for the DD
+                base_time = datetime.datetime(year=date.year, month=date.month, day=date.day, hour=hour)
+                all_desired_deposit_datetimes.append(base_time + datetime.timedelta(minutes=minute))
+            except Exception as e:
+                print(f"Warning: Could not create datetime for {date} hour {hour}. Skipping package. Error: {e}")
+                continue
 
-# =========================
-# === Parallel Execution ===
-# =========================
-def run_single_simulation(tag, heuristic_name, demand_df, num_s, num_m, num_l, position):
-    bank = LockerBank(num_s, num_m, num_l)
-    agent = AssignmentAgent(bank)
-    sim = LockerBankSimulator(bank, demand_df, agent, heuristic=heuristic_name, position=position)
-    sim.run()
-    summary = sim.summarize(tag=tag)
-    return tag, summary
+    random.shuffle(all_desired_deposit_datetimes)
+    
+    # --- Iterate package by package ---
+    for i in range(len(all_desired_deposit_datetimes)):
+        
+        # 1. Get Desired Deposit Time (DD)
+        desired_deposit_dt = all_desired_deposit_datetimes[i]
+        
+        # 2. Generate Real Deposit Time (RD) = DD + offset
+        deposit_offset_hours = random.uniform(DEPOSIT_OFFSET_MIN, DEPOSIT_OFFSET_MAX)
+        real_deposit_dt = desired_deposit_dt + datetime.timedelta(hours=deposit_offset_hours)
+            
+        # 3. Generate Real Pickup Time (RP) based on RD + Matrix
+        rd_hour = real_deposit_dt.hour
+        
+        # Get the conditional probability row P(p|d) using the REAL deposit hour
+        conditional_probs = CONDITIONAL_PICKUP_PROBS_MATRIX[rd_hour]
+        
+        # Sample the pickup hour 'p'
+        rp_hour = np.random.choice(24, p=conditional_probs)
+        # Sample the pickup minute uniformly within the hour
+        rp_minute = np.random.uniform(0, 59.99)
+        
+        rp_date = real_deposit_dt.date()
+        
+        # Apply next-day rule if pickup hour is earlier than deposit hour (Table 3 logic)
+        if rp_hour < rd_hour: 
+            rp_date += datetime.timedelta(days=1)
+            
+        try:
+            base_pickup_time = datetime.datetime(year=rp_date.year, month=rp_date.month, day=rp_date.day, hour=rp_hour)
+            real_pickup_dt = base_pickup_time + datetime.timedelta(minutes=rp_minute)
+        except Exception as e:
+             print(f"Warning: Could not create Real Pickup datetime. Skipping package. Error: {e}")
+             continue
 
-def main():
-    if not os.path.exists(INPUT_DEMAND_CSV):
-        print(f"ERROR: Input file not found: {INPUT_DEMAND_CSV}")
-        print("Please run Task 3 first to generate the demand instance.")
-        return
+        # Edge case check: Ensure RD < RP. 
+        # If RD and RP are in the same hour, the randomly generated minutes might cause inversion.
+        if real_pickup_dt <= real_deposit_dt:
+             # If inversion occurs, force RP to be shortly after RD.
+             real_pickup_dt = real_deposit_dt + MINIMUM_SOJOURN
 
-    # FIX: Ensure all datetime columns are parsed correctly
-    date_cols = ['real_deposit_dt','real_pickup_dt', 'desired_deposit_dt', 'desired_pickup_dt']
-    try:
-        demand_df = pd.read_csv(INPUT_DEMAND_CSV, parse_dates=date_cols)
-    except Exception as e:
-        print(f"Error reading CSV or parsing dates. Ensure Task 3 output is correct. Error: {e}")
-        return
+        # 4. Generate Desired Pickup Time (DP) = RD + Fixed Window
+        desired_pickup_dt = real_deposit_dt + FIXED_DESIRED_WINDOW
 
-    print(f"Loaded {len(demand_df):,} records. Output dir: '{OUT_DIR}'")
 
-    simulations_to_run = [
-        ('A_T5_Strawman', 't5_strawman'),
-        ('B_T5_Smarter', 't5_smarter'),
-    ]
+        # Final assertion (should always pass due to step 3 checks)
+        assert real_pickup_dt > real_deposit_dt, "Sojourn time constraint failed!"
 
-    n_cores = os.cpu_count() or 1
-    n_jobs = max(1, n_cores - 1) # Use available cores, maybe leave one free
-    print(f"\n🚀 Starting parallel simulations on {n_jobs} cores...")
-    # Add space for progress bars
-    print("\n" * (len(simulations_to_run)))
+        # 5. Append the package
+        # We use the i-th size for the i-th successful package generation.
+        # This is statistically sound as sizes are i.i.d.
+        package_list.append({
+            'min_size_ft3': required_sizes[i], 
+            'desired_deposit_dt': desired_deposit_dt,
+            'desired_pickup_dt': desired_pickup_dt, 
+            'real_deposit_dt': real_deposit_dt,
+            'real_pickup_dt': real_pickup_dt
+        })
+        
+    return package_list
 
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(run_single_simulation)(
-            tag, heuristic_name, demand_df, NUM_SMALL, NUM_MEDIUM, NUM_LARGE, i
-        ) for i, (tag, heuristic_name) in enumerate(simulations_to_run)
+
+# =============================================================================
+# --- Section 3: Main Simulator Function ---
+# =============================================================================
+
+def generate_five_year_demand_instance(
+    simulation_mode: str = 'random', 
+    fixed_demand: int = None
+) -> pd.DataFrame:
+    """
+    Develops a locker bank demand simulator (Task 3).
+    """
+    
+    # --- Determine Annual Demand Path ---
+    if simulation_mode == 'steady':
+        print(f"--- Starting 5-Year STEADY STATE (Weighted Average) Demand Simulation ---")
+        annual_demands = _calculate_expected_annual_demands(SCENARIO_TREE, SCENARIO_DEMANDS)
+    elif simulation_mode == 'fixed':
+        print(f"--- Starting 5-Year FIXED Demand Simulation ---")
+        if fixed_demand is None: fixed_demand = 80000
+        annual_demands = [fixed_demand] * 5
+    else: # 'random' or 'highest'
+        print(f"--- Starting 5-Year Dynamic Demand Simulation (Mode: {simulation_mode.upper()}) ---")
+        annual_demands = _simulate_annual_demand_path(mode=simulation_mode)
+        
+    print(f"Annual Demand Targets: {annual_demands}")
+
+    # --- Setup Date Range Template ---
+    # We use the Start Year to define the initial 5-year simulation period for demand generation
+    start_date = datetime.date(START_YEAR, 1, 1)
+    # The simulation ends at the stroke of midnight when the 5th year finishes
+    end_date = datetime.date(START_YEAR + 5, 1, 1) - datetime.timedelta(days=1)
+    date_range = pd.to_datetime(pd.date_range(start=start_date, end=end_date, freq='D'))
+    
+    daily_demand_df = pd.DataFrame(date_range, columns=['date'])
+    daily_demand_df['year'] = daily_demand_df['date'].dt.year
+    # Calculate the 28-day period (1-13), handling day-of-year correctly
+    daily_demand_df['period'] = ((daily_demand_df['date'].dt.dayofyear - 1) // 28) + 1
+    daily_demand_df['period'] = daily_demand_df['period'].clip(upper=13)
+    daily_demand_df['day_of_week'] = daily_demand_df['date'].dt.dayofweek
+    
+    # --- Simulate Daily Demand (Table 2 logic) ---
+    # This section distributes the annual demand down to the daily level based on period and DOW shares/CVs.
+    all_years_dfs = []
+    for year_idx, total_annual_demand in enumerate(annual_demands):
+        year = START_YEAR + year_idx
+        year_df_template = daily_demand_df[daily_demand_df['year'] == year].copy()
+        
+        all_period_dfs = []
+        # 1. Simulate Period Demand
+        for period_num in range(1, 14):
+            period_df = year_df_template[year_df_template['period'] == period_num].copy()
+            if len(period_df) == 0: continue
+
+            expected_period_demand = total_annual_demand * PERIOD_DEMAND_SHARE[period_num]
+            period_std_dev = expected_period_demand * PERIOD_CV
+            simulated_period_demand = int(max(0, round(np.random.normal(expected_period_demand, period_std_dev))))
+
+            # 2. Simulate Daily Demand within Period
+            if len(period_df) > 0 and simulated_period_demand > 0:
+                period_df['dow_share'] = period_df['day_of_week'].map(DAY_OF_WEEK_SHARE_FROM_PDF)
+                total_dow_share_in_period = period_df['dow_share'].sum()
+                
+                if total_dow_share_in_period > 0:
+                    period_df['daily_share_of_period'] = period_df['dow_share'] / total_dow_share_in_period
+                    period_df['expected_daily'] = simulated_period_demand * period_df['daily_share_of_period']
+                else:
+                    # Fallback if shares are somehow zero (should not happen with provided data)
+                    period_df['expected_daily'] = simulated_period_demand / len(period_df)
+                
+                # Apply Daily CV
+                daily_std_dev = period_df['expected_daily'] * DAILY_DEMAND_CV
+                period_df['simulated_daily'] = np.random.normal(period_df['expected_daily'], daily_std_dev)
+                period_df['simulated_daily'] = period_df['simulated_daily'].fillna(0).round().astype(int).clip(lower=0)
+                
+                # 3. Normalize daily demand to exactly match the simulated period demand
+                current_sum = period_df['simulated_daily'].sum()
+                if current_sum > 0:
+                    scale_factor = simulated_period_demand / current_sum
+                    period_df['final_daily_demand'] = (period_df['simulated_daily'] * scale_factor).round().astype(int)
+                else:
+                    # If all simulated daily demands were 0 but period demand > 0, redistribute based on expectation
+                    if period_df['expected_daily'].sum() > 0:
+                        weights = period_df['expected_daily'] / period_df['expected_daily'].sum()
+                        counts = (weights * simulated_period_demand).round().astype(int)
+                        period_df['final_daily_demand'] = counts
+                    else:
+                         period_df['final_daily_demand'] = 0
+
+                # Handle remainder due to rounding
+                remainder = simulated_period_demand - period_df['final_daily_demand'].sum()
+                if remainder != 0:
+                    # Distribute the remainder randomly across the days in the period
+                    indices = np.random.choice(period_df.index, size=abs(int(remainder)), replace=True)
+                    adjustment = 1 if remainder > 0 else -1
+                    for idx in indices:
+                        # Ensure demand doesn't drop below zero if subtracting
+                        if period_df.loc[idx, 'final_daily_demand'] + adjustment >= 0:
+                            period_df.loc[idx, 'final_daily_demand'] += adjustment
+
+            else:
+                 period_df['final_daily_demand'] = 0
+
+            all_period_dfs.append(period_df)
+        
+        if all_period_dfs:
+            year_df_final = pd.concat(all_period_dfs)
+            all_years_dfs.append(year_df_final)
+
+    if not all_years_dfs: return pd.DataFrame()
+    
+    final_demand_schedule = pd.concat(all_years_dfs)
+    
+    # --- Generate Individual Package Details ---
+    all_packages = []
+    print("\nGenerating individual package details for each day...")
+    # Iterate over the daily demand schedule. The 'date' here is the date for the initial Desired Deposit.
+    for _, row in tqdm(final_demand_schedule.iterrows(), total=len(final_demand_schedule), desc="Daily Progress"):
+        num_packages_today = row['final_daily_demand']
+        if num_packages_today > 0:
+            # Call the function with the modified logic
+            packages_today = _generate_packages_for_one_day(int(num_packages_today), row['date'].date())
+            all_packages.extend(packages_today)
+            
+    print("\nSimulation complete. Finalizing DataFrame.")
+    demand_instance_df = pd.DataFrame(all_packages)
+    
+    if not demand_instance_df.empty:
+        demand_instance_df.insert(0, 'package_id', range(1, len(demand_instance_df) + 1))
+    
+    return demand_instance_df
+
+
+# =============================================================================
+# --- Section 4: Execution Block (Example Usage and Verification) ---
+# =============================================================================
+if __name__ == '__main__':
+    # Set seed for reproducibility if desired
+    # np.random.seed(42)
+    # random.seed(42)
+
+    SIMULATION_MODE = 'random' # Options: 'random', 'highest', 'steady', 'fixed'
+    FIXED_DEMAND_VALUE = 80000 
+    
+    demand_df = generate_five_year_demand_instance(
+        simulation_mode=SIMULATION_MODE,
+        fixed_demand=FIXED_DEMAND_VALUE 
     )
+    
+    output_folder = "Task_3_Outcome"
+    os.makedirs(output_folder, exist_ok=True)
 
-    print("\n--- All simulations finished. Generating summaries... ---")
+    if not demand_df.empty:
+        print("\n\n--- Simulation Output Summary ---")
+        print(f"Successfully generated {len(demand_df):,} package demand instances.")
+        
+        # --- Verification Step ---
+        print("\n--- Verification Checks (Based on New Logic) ---")
+        for col in ["desired_deposit_dt", "desired_pickup_dt", "real_deposit_dt", "real_pickup_dt"]:
+            demand_df[col] = pd.to_datetime(demand_df[col])
 
-    for tag, summary_text in sorted(results):
-        print(summary_text)
+        # Check 1: Real Sojourn Time (Must be > 0) (RP > RD)
+        demand_df["real_sojourn_hours"] = (demand_df["real_pickup_dt"] - demand_df["real_deposit_dt"]).dt.total_seconds() / 3600.0
+        min_real_sojourn = demand_df["real_sojourn_hours"].min()
+        print(f"Minimum Real Sojourn Hours: {min_real_sojourn:.4f}")
+        if min_real_sojourn <= 0:
+            print("❌ ERROR: Negative or zero real sojourn times detected!")
+        else:
+            print("✅ SUCCESS: All real sojourn times are positive (RP > RD).")
 
-    print(f"\n✅ All simulations complete. Results are in '{OUT_DIR}'.")
+        # Check 2: Desired Pickup vs Real Deposit (DP = RD + Fixed Window)
+        desired_window_check = (demand_df["desired_pickup_dt"] - demand_df["real_deposit_dt"]).dt.total_seconds() / 3600.0
+        min_window = desired_window_check.min()
+        max_window = desired_window_check.max()
+        target_window_hours = FIXED_DESIRED_WINDOW.total_seconds() / 3600.0
+        print(f"Desired Window (DP - RD) Hours: Min={min_window:.4f}, Max={max_window:.4f}, Target={target_window_hours:.1f}")
+        
+        # Allowing a small tolerance for floating point comparison
+        if abs(min_window - target_window_hours) < 0.001 and abs(max_window - target_window_hours) < 0.001:
+             print("✅ SUCCESS: Desired pickup time is correctly fixed relative to real deposit (DP = RD + Window).")
+        else:
+             print("❌ ERROR: Desired pickup time window mismatch!")
+
+        
+        # --- Output Generation ---
+        print("\nSample Data (First 5 rows):")
+        print(demand_df.head())
+        
+        filename = f"task3_demand_instance_{SIMULATION_MODE}_mode.csv"
+        output_filepath = os.path.join(output_folder, filename)
+        
+        columns_to_save = ['package_id', 'min_size_ft3', 'desired_deposit_dt', 'desired_pickup_dt', 'real_deposit_dt', 'real_pickup_dt', 'real_sojourn_hours']
+        demand_df[columns_to_save].to_csv(output_filepath, index=False)
+        print(f"\n✅ Full demand instance saved to '{output_filepath}'")
+
+    else:
+        print("\n--- Simulation resulted in an empty demand set. ---")
+
+    print("\n--- Simulation complete. ---")
+
+    import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+import os
+
+def visualize_demand_data(input_filepath: str, output_folder: str):
+    """
+    Reads the simulated demand data and generates several visualizations.
+
+    Args:
+        input_filepath (str): The path to the input CSV file.
+        output_folder (str): The folder where the plot images will be saved.
+    """
+    # --- 1. Load and Prepare Data ---
+    print(f"Reading data from '{input_filepath}'...")
+    if not os.path.exists(input_filepath):
+        print(f"Error: Input file not found at '{input_filepath}'.")
+        print("Please run the main simulation script first to generate the CSV file.")
+        return
+
+    df = pd.read_csv(input_filepath)
+    
+    # Convert datetime columns from string to datetime objects
+    for col in ['real_deposit_dt', 'real_pickup_dt']:
+        df[col] = pd.to_datetime(df[col])
+    
+    print("Data loaded successfully. Generating plots...")
+    
+    # Set plot style for better aesthetics
+    sns.set_theme(style="whitegrid")
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(output_folder, exist_ok=True)
+
+    # --- 2. Plot 1: Daily Demand Over 5 Years ---
+    plt.figure(figsize=(15, 7))
+    daily_counts = df.set_index('real_deposit_dt').resample('D').size()
+    daily_counts.plot(color='royalblue', alpha=0.8)
+    
+    plt.title('Simulated Daily Package Demand (5-Year Horizon)', fontsize=16, fontweight='bold')
+    plt.xlabel('Date', fontsize=12)
+    plt.ylabel('Number of Packages', fontsize=12)
+    plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plot1_path = os.path.join(output_folder, '01_daily_demand_over_time.png')
+    plt.savefig(plot1_path)
+    plt.close()
+    print(f"✅ Plot 1 saved to '{plot1_path}'")
+
+    # --- 3. Plot 2: Hourly Distribution of Deposits and Pickups ---
+    plt.figure(figsize=(15, 7))
+    
+    # Get hour for deposits and pickups
+    deposit_hours = df['real_deposit_dt'].dt.hour
+    pickup_hours = df['real_pickup_dt'].dt.hour
+    
+    sns.histplot(deposit_hours, bins=24, discrete=True, color='skyblue', label='Deposits', alpha=0.7)
+    sns.histplot(pickup_hours, bins=24, discrete=True, color='coral', label='Pickups', alpha=0.7)
+    
+    plt.title('Hourly Distribution of Package Deposits and Pickups', fontsize=16, fontweight='bold')
+    plt.xlabel('Hour of the Day', fontsize=12)
+    plt.ylabel('Total Count', fontsize=12)
+    plt.xticks(range(24))
+    plt.legend()
+    plt.grid(axis='y', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plot2_path = os.path.join(output_folder, '02_hourly_distribution.png')
+    plt.savefig(plot2_path)
+    plt.close()
+    print(f"✅ Plot 2 saved to '{plot2_path}'")
+    
+    # --- 4. Plot 3: Sojourn Time Distribution ---
+    plt.figure(figsize=(12, 6))
+    
+    # Use the pre-calculated 'real_sojourn_hours' if available
+    if 'real_sojourn_hours' in df.columns:
+        sojourn_hours = df['real_sojourn_hours']
+    else:
+        sojourn_hours = (df['real_pickup_dt'] - df['real_deposit_dt']).dt.total_seconds() / 3600
+
+    sns.histplot(sojourn_hours, bins=50, kde=True, color='teal')
+    plt.title('Distribution of Package Sojourn Time in Locker', fontsize=16, fontweight='bold')
+    plt.xlabel('Sojourn Time (Hours)', fontsize=12)
+    plt.ylabel('Frequency', fontsize=12)
+    plt.grid(axis='y', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plot3_path = os.path.join(output_folder, '03_sojourn_time_distribution.png')
+    plt.savefig(plot3_path)
+    plt.close()
+    print(f"✅ Plot 3 saved to '{plot3_path}'")
+
+    # --- 5. Plot 4: Package Size Distribution ---
+    plt.figure(figsize=(12, 6))
+    size_counts = df['min_size_ft3'].value_counts().sort_index()
+    
+    sns.barplot(x=size_counts.index, y=size_counts.values, palette='viridis')
+    
+    plt.title('Distribution of Required Package Sizes', fontsize=16, fontweight='bold')
+    plt.xlabel('Minimum Size (ft³)', fontsize=12)
+    plt.ylabel('Total Count', fontsize=12)
+    plt.grid(axis='y', linestyle='--', linewidth=0.5)
+    plt.tight_layout()
+    plot4_path = os.path.join(output_folder, '04_package_size_distribution.png')
+    plt.savefig(plot4_path)
+    plt.close()
+    print(f"✅ Plot 4 saved to '{plot4_path}'")
+    
+    print("\nAll visualizations have been generated successfully.")
+
 
 if __name__ == '__main__':
-    main()
+    # --- Configuration ---
+    # This should be the file generated by your main simulation script.
+    # We assume the 'random' mode was used. Change if you used a different mode.
+    INPUT_CSV = os.path.join("Task_3_Outcome", "task3_demand_instance_random_mode.csv")
+    
+    # The folder where the output plots will be saved.
+    OUTPUT_PLOT_FOLDER = "Task_3_Outcome/Visualizations"
+    
+    # --- Execution ---
+    visualize_demand_data(input_filepath=INPUT_CSV, output_folder=OUTPUT_PLOT_FOLDER)
