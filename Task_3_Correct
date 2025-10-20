@@ -5,12 +5,30 @@ import random
 from tqdm import tqdm
 import os
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # =============================================================================
-# --- Section 1: Constants from Casework Document (No changes) ---
+# --- Section 1: Constants from Casework Document ---
 # =============================================================================
+# Demand variability
 PERIOD_CV = 0.2
 DAILY_DEMAND_CV = 0.25
+
+# Time variability (Casework Page 3-4)
+DEPOSIT_OFFSET_MIN = -1.5  # 90 minutes early
+DEPOSIT_OFFSET_MAX = 180.0 # 180 hours late
+
+# Assumed pickup variability (Not explicitly defined in casework, assumed based on original code)
+PICKUP_OFFSET_MIN = -6.0
+PICKUP_OFFSET_MAX = 6.0
+
+# Minimum time a package must stay in the locker (Ensures RD < RP)
+MINIMUM_SOJOURN = datetime.timedelta(minutes=5)
+# Buffer time to ensure RD < DP (Casework requirement)
+DEPOSIT_BUFFER = datetime.timedelta(minutes=5)
+
+
+# Table 1: Package Size Probability
 SIZE_PROBABILITY = {
     1: 0.08, 2: 0.12, 3: 0.15, 4: 0.12, 5: 0.08, 6: 0.06, 7: 0.05,
     8: 0.05, 9: 0.05, 10: 0.04, 11: 0.04, 12: 0.03, 13: 0.03,
@@ -18,16 +36,19 @@ SIZE_PROBABILITY = {
 }
 SIZES = list(SIZE_PROBABILITY.keys())
 SIZE_PROBS = list(SIZE_PROBABILITY.values())
+
+# Table 2: 4-week period demand share
 PERIOD_DEMAND_SHARE = {
     1: 0.03, 2: 0.05, 3: 0.06, 4: 0.07, 5: 0.11, 6: 0.06, 7: 0.04,
     8: 0.10, 9: 0.10, 10: 0.06, 11: 0.08, 12: 0.11, 13: 0.13
 }
-DAY_OF_WEEK_SHARE = {
+
+# Table 2: Day of week demand share (Assuming 0=Monday, 6=Sunday)
+DAY_OF_WEEK_SHARE_FROM_PDF = {
     0: 0.13, 1: 0.12, 2: 0.15, 3: 0.18, 4: 0.20, 5: 0.15, 6: 0.07
-} # PDF shows Su=0.07, Mo=0.13, etc. Code has Mo=0, Tu=1... mapping. We'll assume code's 0=Mo, 6=Su mapping.
-DAY_OF_WEEK_SHARE_FROM_PDF = { 
-    0: 0.13, 1: 0.12, 2: 0.15, 3: 0.18, 4: 0.20, 5: 0.15, 6: 0.07 
-} # Using this to match code's internal logic (0=Monday)
+}
+
+# Figure 1: Scenario Tree
 SCENARIO_TREE = {
     'start': [('1.1', 0.25), ('1.2', 0.25), ('1.3', 0.5)], '1.1': [('2.1', 0.3), ('2.2', 0.4), ('2.3', 0.3)],
     '1.2': [('2.2', 0.6), ('2.3', 0.4)], '1.3': [('2.4', 0.6), ('2.5', 0.4)], '2.1': [('3.1', 0.5), ('3.2', 0.5)],
@@ -44,13 +65,7 @@ SCENARIO_DEMANDS = {
     '4.4': 105000, '4.5': 120000, '5.1': 60000, '5.2': 65000, '5.3': 90000, '5.4': 110000, '5.5': 150000
 }
 
-# --- MODIFIED SECTION: Added full Matrix from Table 3 ---
-
-# Daily deposit distribution (Total column from Table 3)
-DAILY_DEPOSIT_DIST = np.array([200, 200, 100, 100, 300, 300, 400, 400, 600, 600, 600, 600, 400, 600, 800, 600, 600, 600, 500, 500, 400, 200, 200, 200])
-DEPOSIT_HOUR_PROBS = DAILY_DEPOSIT_DIST / DAILY_DEPOSIT_DIST.sum()
-
-# Full Deposit-Pickup Matrix (Table 3, Prob x 10,000)
+# Table 3: Deposit-Pickup Matrix (Probability x 10,000)
 DEPOSIT_PICKUP_MATRIX = np.array([
     [30, 20, 4, 4, 4, 10, 20, 24, 32, 20, 12, 12, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     [0, 24, 12, 6, 4, 10, 20, 24, 32, 20, 16, 12, 12, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -78,12 +93,16 @@ DEPOSIT_PICKUP_MATRIX = np.array([
     [30, 14, 6, 0, 0, 0, 16, 40, 36, 16, 6, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30]
 ], dtype=float)
 
+# Calculate Daily deposit distribution (Sum of the rows)
+DAILY_DEPOSIT_DIST = DEPOSIT_PICKUP_MATRIX.sum(axis=1)
+DEPOSIT_HOUR_PROBS = DAILY_DEPOSIT_DIST / DAILY_DEPOSIT_DIST.sum()
+
 # Calculate conditional probabilities P(p|d)
 row_sums_d = DAILY_DEPOSIT_DIST.reshape(-1, 1)
 CONDITIONAL_PICKUP_PROBS_MATRIX = np.divide(
-    DEPOSIT_PICKUP_MATRIX, 
-    row_sums_d, 
-    out=np.zeros_like(DEPOSIT_PICKUP_MATRIX), 
+    DEPOSIT_PICKUP_MATRIX,
+    row_sums_d,
+    out=np.zeros_like(DEPOSIT_PICKUP_MATRIX),
     where=row_sums_d!=0
 )
 
@@ -95,91 +114,81 @@ START_YEAR = 2026
 # =============================================================================
 
 def _generate_intra_hour_arrival_minutes(N, lsp_proportion=0.8, lsp_mean=15, lsp_std=5):
+    """
+    Generates arrival minutes within an hour (Task 2 logic).
+    LSPs (Logistic Service Provider) tend to arrive earlier, Customers are uniform.
+    """
     if N <= 0: return []
-    n_lsp = int(round(N * lsp_proportion)); n_cust = N - n_lsp
-    lsp_times = np.clip(np.random.normal(loc=lsp_mean, scale=lsp_std, size=n_lsp), 0, 60)
-    cust_times = np.random.uniform(0, 60, n_cust)
-    all_times = np.concatenate((lsp_times, cust_times)); all_times.sort()
+    n_lsp = int(round(N * lsp_proportion))
+    n_cust = N - n_lsp
+    
+    # LSP arrivals (Normal distribution, centered early, clipped 0-60)
+    lsp_times = np.clip(np.random.normal(loc=lsp_mean, scale=lsp_std, size=n_lsp), 0, 59.99)
+    # Customer arrivals (Uniform distribution)
+    cust_times = np.random.uniform(0, 59.99, n_cust)
+    
+    all_times = np.concatenate((lsp_times, cust_times))
+    all_times.sort()
     return list(all_times)
 
 
 def _simulate_annual_demand_path(mode='random') -> list[int]:
-    """
-    Simulates a 5-year demand path through the scenario tree.
-    (This function is now only used for 'random' and 'highest' modes)
-    
-    Args:
-        mode (str): 'random' for a probabilistic path, 
-                    'highest' for a deterministic path that always chooses the highest demand option.
-    
-    Returns:
-        list[int]: A list of 5 annual demand values.
-    """
+    """Simulates a 5-year demand path through the scenario tree (Figure 1)."""
     annual_demands = []
     current_node = 'start'
     for _ in range(5):
-        next_states = SCENARIO_TREE[current_node]
+        next_states = SCENARIO_TREE.get(current_node)
+        if not next_states: break
+            
         nodes, probabilities = zip(*next_states)
         
         if mode == 'highest':
-            # Deterministic: Find the next node that has the maximum possible demand value
-            chosen_node = max(nodes, key=lambda node: SCENARIO_DEMANDS[node])
+            chosen_node = max(nodes, key=lambda node: SCENARIO_DEMANDS.get(node, 0))
         else: # Default to 'random'
-            # Probabilistic: Choose the next node based on given probabilities
             chosen_node = np.random.choice(nodes, p=probabilities)
             
-        annual_demands.append(SCENARIO_DEMANDS[chosen_node])
+        annual_demands.append(SCENARIO_DEMANDS.get(chosen_node, 0))
         current_node = chosen_node
         
     return annual_demands
 
-### --- NEW FUNCTION --- ###
+
 def _calculate_expected_annual_demands(tree: dict, demands: dict) -> list[int]:
-    """
-    Calculates the weighted average (expected) demand for each of the 5 years
-    by propagating probabilities through the scenario tree.
-    
-    Returns:
-        list[int]: A 5-element list of the expected annual demand for each year.
-    """
-    # 1. Store absolute probabilities of reaching each node
+    """Calculates the weighted average (expected) demand for each of the 5 years."""
     absolute_probs = {}
-
-    # 2. Group nodes by year
-    year_nodes = {1: [], 2: [], 3: [], 4: [], 5: []}
+    year_nodes = {y: [] for y in range(1, 6)}
+    
+    # Group nodes by year
     for node_name in demands.keys():
-        year = int(node_name.split('.')[0])
-        if year in year_nodes:
-            year_nodes[year].append(node_name)
+        try:
+            year = int(node_name.split('.')[0])
+            if year in year_nodes:
+                year_nodes[year].append(node_name)
+        except ValueError: continue
 
-    # 3. Initialize probabilities for Year 1 (from 'start')
-    for next_node, prob in tree['start']:
+    # Initialize Year 1
+    for next_node, prob in tree.get('start', []):
         absolute_probs[next_node] = prob
 
-    # 4. Propagate probabilities for Years 2 through 5
+    # Propagate probabilities Years 2-5
     for year in range(2, 6):
-        # Initialize probabilities for the current year's nodes to 0
         for node_name in year_nodes[year]:
             absolute_probs[node_name] = 0.0
         
-        # Get previous year's nodes
         prev_year_nodes = year_nodes[year - 1]
-        
-        # Calculate P(current_node) = sum[ P(prev_node) * P(current_node | prev_node) ]
         for prev_node in prev_year_nodes:
             prev_prob = absolute_probs.get(prev_node, 0)
             if prev_prob == 0: continue
             
             next_states = tree.get(prev_node, [])
             for next_node, conditional_prob in next_states:
-                if next_node in absolute_probs: # Should always be true
+                if next_node in absolute_probs:
                     absolute_probs[next_node] += prev_prob * conditional_prob
 
-    # 5. Calculate expected demand for each year
+    # Calculate expected demand
     expected_annual_demands = []
     for year in range(1, 6):
         expected_demand_for_year = 0.0
-        # Check if year exists and has nodes
         if year in year_nodes and year_nodes[year]:
             for node_name in year_nodes[year]:
                 prob = absolute_probs.get(node_name, 0)
@@ -192,15 +201,14 @@ def _calculate_expected_annual_demands(tree: dict, demands: dict) -> list[int]:
 
 def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> list[dict]:
     """
-    Generates all package details for a single day based on Casework logic.
-    (Function logic is unchanged from your last version)
+    Generates package details for a single day.
+    *** THIS FUNCTION CONTAINS THE CORRECTED LOGIC ***
     """
     if num_packages <= 0: return []
     package_list = []
     
-    # --- Generate Desired Deposit Times (Unchanged) ---
+    # --- Generate Sizes and Desired Deposit Times (DD) ---
     required_sizes = np.random.choice(SIZES, size=num_packages, p=SIZE_PROBS)
-    # Sample deposit hour 'd' from the "Total" column distribution 
     deposit_hours = np.random.choice(24, size=num_packages, p=DEPOSIT_HOUR_PROBS)
     hourly_deposit_counts = pd.Series(deposit_hours).value_counts().to_dict()
     
@@ -208,51 +216,81 @@ def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> li
     for hour, count in hourly_deposit_counts.items():
         arrival_minutes = _generate_intra_hour_arrival_minutes(count)
         for minute in arrival_minutes:
-            base_time = datetime.datetime.combine(date, datetime.time(hour=hour))
-            all_deposit_datetimes.append(base_time + datetime.timedelta(minutes=minute))
+            # Create datetime objects robustly
+            try:
+                base_time = datetime.datetime(year=date.year, month=date.month, day=date.day, hour=hour)
+                all_deposit_datetimes.append(base_time + datetime.timedelta(minutes=minute))
+            except Exception as e:
+                print(f"Warning: Could not create datetime for {date} hour {hour}. Skipping package. Error: {e}")
+                continue
+
     random.shuffle(all_deposit_datetimes)
     
-    # --- MODIFIED: Loop and generate all times package by package ---
-    for i in range(num_packages):
+    # --- Iterate package by package ---
+    for i in range(len(all_deposit_datetimes)):
         
-        # 1. Get the Desired Deposit Time
+        # 1. Get Desired Deposit Time (DD)
         desired_deposit_dt = all_deposit_datetimes[i]
-        
-        # 2. Generate Desired Pickup Time (Based on Casework Table 3 logic)
         deposit_hour_d = desired_deposit_dt.hour
         
-        # Get the conditional probability row P(p|d) from the matrix 
+        # 2. Generate Desired Pickup Time (DP)
         conditional_probs = CONDITIONAL_PICKUP_PROBS_MATRIX[deposit_hour_d]
-        
-        # Sample the pickup hour 'p' based on P(p|d)
         pickup_hour_p = np.random.choice(24, p=conditional_probs)
-        pickup_minute = np.random.uniform(0, 60) # Generate minute on the fly
+        pickup_minute = np.random.uniform(0, 59.99)
         
         pickup_date = desired_deposit_dt.date()
         
-        # Apply next-day rule if pickup hour is earlier than deposit hour
+        # Apply next-day rule (ensures DD < DP)
         if pickup_hour_p < deposit_hour_d: 
             pickup_date += datetime.timedelta(days=1)
-            
-        base_pickup_time = datetime.datetime.combine(pickup_date, datetime.time(hour=pickup_hour_p))
-        desired_pickup_dt = base_pickup_time + datetime.timedelta(minutes=pickup_minute)
+        
+        try:
+            base_pickup_time = datetime.datetime(year=pickup_date.year, month=pickup_date.month, day=pickup_date.day, hour=pickup_hour_p)
+            desired_pickup_dt = base_pickup_time + datetime.timedelta(minutes=pickup_minute)
+        except Exception as e:
+            print(f"Warning: Could not create pickup datetime. Skipping package. Error: {e}")
+            continue
 
-        # 3. Generate Real Deposit and Pickup Times (Logic Unchanged)
-        deposit_offset_hours = random.uniform(-1.5, 180.0) 
-        pickup_offset_hours = random.uniform(-6.0, 6.0) 
+        # Edge case check: Ensure DD < DP even if hours are the same but minutes cause overlap
+        if desired_pickup_dt <= desired_deposit_dt:
+             desired_pickup_dt = desired_deposit_dt + MINIMUM_SOJOURN
+
+        # 3. Generate Real Deposit Time (RD)
+        deposit_offset_hours = random.uniform(DEPOSIT_OFFSET_MIN, DEPOSIT_OFFSET_MAX)
         potential_real_deposit_dt = desired_deposit_dt + datetime.timedelta(hours=deposit_offset_hours)
         
-        if potential_real_deposit_dt >= desired_pickup_dt: 
-            real_deposit_dt = desired_pickup_dt - datetime.timedelta(hours=1) 
+        # Constraint 1: RD must be before DP (Casework requirement)
+        # Enforce RD < DP - Buffer
+        if potential_real_deposit_dt >= (desired_pickup_dt - DEPOSIT_BUFFER):
+            # If deposit is too late, cap it just before desired pickup
+            real_deposit_dt = desired_pickup_dt - DEPOSIT_BUFFER
         else:
             real_deposit_dt = potential_real_deposit_dt
             
-        real_pickup_dt = desired_pickup_dt + datetime.timedelta(hours=pickup_offset_hours)
+        # 4. Generate Real Pickup Time (RP)
+        pickup_offset_hours = random.uniform(PICKUP_OFFSET_MIN, PICKUP_OFFSET_MAX) 
+        potential_real_pickup_dt = desired_pickup_dt + datetime.timedelta(hours=pickup_offset_hours)
+        
+        # Constraint 2: RP must be AFTER RD (Physical requirement) - THE FIX
+        # Enforce RP > RD + Minimum Sojourn
+        if potential_real_pickup_dt <= (real_deposit_dt + MINIMUM_SOJOURN):
+            # If pickup attempt is before deposit, force it to happen just after the deposit
+            real_pickup_dt = real_deposit_dt + MINIMUM_SOJOURN
+        else:
+            real_pickup_dt = potential_real_pickup_dt
 
-        # 4. Append the package
-        package_list.append({'min_size_ft3': required_sizes[i], 'desired_deposit_dt': desired_deposit_dt,
-                             'desired_pickup_dt': desired_pickup_dt, 'real_deposit_dt': real_deposit_dt,
-                             'real_pickup_dt': real_pickup_dt})
+        # Final check
+        assert real_pickup_dt > real_deposit_dt, "Sojourn time constraint failed!"
+
+        # 5. Append the package
+        package_list.append({
+            'min_size_ft3': required_sizes[i], 
+            'desired_deposit_dt': desired_deposit_dt,
+            'desired_pickup_dt': desired_pickup_dt, 
+            'real_deposit_dt': real_deposit_dt,
+            'real_pickup_dt': real_pickup_dt
+        })
+        
     return package_list
 
 
@@ -260,92 +298,93 @@ def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> li
 # --- Section 3: Main Simulator Function ---
 # =============================================================================
 
-### MODIFIED FUNCTION ###
 def generate_five_year_demand_instance(
     simulation_mode: str = 'random', 
     fixed_demand: int = None
 ) -> pd.DataFrame:
     """
-    Develops a locker bank demand simulator.
-    
-    Args:
-        simulation_mode (str): Can be:
-                                'random':  A random path through the scenario tree.
-                                'highest': The highest-demand path.
-                                'steady':  The weighted-average (expected) demand path.
-                                'fixed':   A single fixed annual demand for all 5 years.
-        fixed_demand (int):      Annual demand to use if mode is 'fixed'.
-                                 Defaults to 80000 if mode='fixed' and this is None.
+    Develops a locker bank demand simulator (Task 3).
     """
     
-    # --- NEW: Mode-switching logic for annual demand ---
+    # --- Determine Annual Demand Path ---
     if simulation_mode == 'steady':
         print(f"--- Starting 5-Year STEADY STATE (Weighted Average) Demand Simulation ---")
         annual_demands = _calculate_expected_annual_demands(SCENARIO_TREE, SCENARIO_DEMANDS)
-        print(f"Calculated Weighted Average Annual Demands: {annual_demands}")
-
     elif simulation_mode == 'fixed':
         print(f"--- Starting 5-Year FIXED Demand Simulation ---")
-        if fixed_demand is None:
-            fixed_demand = 80000 # Default to a reasonable average
-            print("No fixed_demand provided, defaulting to 80,000/year.")
+        if fixed_demand is None: fixed_demand = 80000
         annual_demands = [fixed_demand] * 5
-        print(f"Using Fixed Annual Demand: {fixed_demand:,}")
-        
     else: # 'random' or 'highest'
         print(f"--- Starting 5-Year Dynamic Demand Simulation (Mode: {simulation_mode.upper()}) ---")
         annual_demands = _simulate_annual_demand_path(mode=simulation_mode)
-        print(f"Simulated Annual Demand Path (Mean Targets): {annual_demands}")
-    # --- END OF NEW LOGIC ---
+        
+    print(f"Annual Demand Targets: {annual_demands}")
 
+    # --- Setup Date Range Template ---
     start_date = datetime.date(START_YEAR, 1, 1)
-    end_date = start_date + datetime.timedelta(days=int(5 * 365.25) - 1)
+    end_date = datetime.date(START_YEAR + 5, 1, 1) - datetime.timedelta(days=1)
     date_range = pd.to_datetime(pd.date_range(start=start_date, end=end_date, freq='D'))
     
     daily_demand_df = pd.DataFrame(date_range, columns=['date'])
     daily_demand_df['year'] = daily_demand_df['date'].dt.year
     daily_demand_df['period'] = ((daily_demand_df['date'].dt.dayofyear - 1) // 28) + 1
     daily_demand_df['period'] = daily_demand_df['period'].clip(upper=13)
-    daily_demand_df['day_of_week'] = daily_demand_df['date'].dt.dayofweek # 0=Monday, 6=Sunday
+    daily_demand_df['day_of_week'] = daily_demand_df['date'].dt.dayofweek
     
+    # --- Simulate Daily Demand (Table 2 logic) ---
     all_years_dfs = []
     for year_idx, total_annual_demand in enumerate(annual_demands):
         year = START_YEAR + year_idx
         year_df_template = daily_demand_df[daily_demand_df['year'] == year].copy()
         
         all_period_dfs = []
+        # 1. Simulate Period Demand
         for period_num in range(1, 14):
             period_df = year_df_template[year_df_template['period'] == period_num].copy()
             if len(period_df) == 0: continue
 
             expected_period_demand = total_annual_demand * PERIOD_DEMAND_SHARE[period_num]
             period_std_dev = expected_period_demand * PERIOD_CV
-            simulated_period_demand = np.random.normal(expected_period_demand, period_std_dev)
-            simulated_period_demand = int(max(0, round(simulated_period_demand)))
+            simulated_period_demand = int(max(0, round(np.random.normal(expected_period_demand, period_std_dev))))
 
-            if len(period_df) > 0:
-                mean_daily_for_period = simulated_period_demand / len(period_df)
+            # 2. Simulate Daily Demand within Period
+            if len(period_df) > 0 and simulated_period_demand > 0:
                 period_df['dow_share'] = period_df['day_of_week'].map(DAY_OF_WEEK_SHARE_FROM_PDF)
-                avg_dow_share_in_period = period_df['dow_share'].mean()
-                period_df['expected_daily'] = mean_daily_for_period * (period_df['dow_share'] / avg_dow_share_in_period)
+                total_dow_share_in_period = period_df['dow_share'].sum()
+                
+                if total_dow_share_in_period > 0:
+                    period_df['daily_share_of_period'] = period_df['dow_share'] / total_dow_share_in_period
+                    period_df['expected_daily'] = simulated_period_demand * period_df['daily_share_of_period']
+                else:
+                    period_df['expected_daily'] = simulated_period_demand / len(period_df)
+                
                 daily_std_dev = period_df['expected_daily'] * DAILY_DEMAND_CV
                 period_df['simulated_daily'] = np.random.normal(period_df['expected_daily'], daily_std_dev)
                 period_df['simulated_daily'] = period_df['simulated_daily'].fillna(0).round().astype(int).clip(lower=0)
                 
+                # 3. Normalize daily demand to exactly match the simulated period demand
                 current_sum = period_df['simulated_daily'].sum()
                 if current_sum > 0:
                     scale_factor = simulated_period_demand / current_sum
                     period_df['final_daily_demand'] = (period_df['simulated_daily'] * scale_factor).round().astype(int)
                 else:
-                    period_df['final_daily_demand'] = 0
+                    # If all simulated daily demands were 0 but period demand > 0, redistribute based on expectation
+                    if period_df['expected_daily'].sum() > 0:
+                        weights = period_df['expected_daily'] / period_df['expected_daily'].sum()
+                        counts = (weights * simulated_period_demand).round().astype(int)
+                        period_df['final_daily_demand'] = counts
+                    else:
+                         period_df['final_daily_demand'] = 0
 
+                # Handle remainder due to rounding
                 remainder = simulated_period_demand - period_df['final_daily_demand'].sum()
-                if remainder > 0:
-                    demand_values = period_df['final_daily_demand'].values
-                    if demand_values.size > 0:
-                        add_indices = np.random.choice(demand_values.size, size=int(remainder), replace=True)
-                        np.add.at(demand_values, add_indices, 1)
-                        period_df['final_daily_demand'] = demand_values
+                if remainder != 0:
+                    indices = np.random.choice(period_df.index, size=abs(int(remainder)), replace=True)
+                    adjustment = 1 if remainder > 0 else -1
+                    for idx in indices:
+                        if period_df.loc[idx, 'final_daily_demand'] + adjustment >= 0:
+                            period_df.loc[idx, 'final_daily_demand'] += adjustment
+
             else:
                  period_df['final_daily_demand'] = 0
 
@@ -359,11 +398,13 @@ def generate_five_year_demand_instance(
     
     final_demand_schedule = pd.concat(all_years_dfs)
     
+    # --- Generate Individual Package Details ---
     all_packages = []
     print("\nGenerating individual package details for each day...")
     for _, row in tqdm(final_demand_schedule.iterrows(), total=len(final_demand_schedule), desc="Daily Progress"):
         num_packages_today = row['final_daily_demand']
         if num_packages_today > 0:
+            # Call the corrected function
             packages_today = _generate_packages_for_one_day(int(num_packages_today), row['date'].date())
             all_packages.extend(packages_today)
             
@@ -377,75 +418,63 @@ def generate_five_year_demand_instance(
 
 
 # =============================================================================
-# --- Section 4: Execution Block ---
+# --- Section 4: Execution Block (Example Usage and Verification) ---
 # =============================================================================
 if __name__ == '__main__':
-    ### CHOOSE YOUR SIMULATION MODE HERE ###
-    # 'random':  A different probabilistic path each time you run.
-    # 'highest': A deterministic high-demand path for stress testing.
-    # 'steady':  Calculates the weighted-average (expected) demand path.
-    # 'fixed':   A single fixed annual demand for all 5 years (see value below).
-    SIMULATION_MODE = 'steady' 
-    
-    # This value is ONLY used if SIMULATION_MODE = 'fixed'
+    # Set seed for reproducibility if needed
+    # np.random.seed(42)
+    # random.seed(42)
+
+    SIMULATION_MODE = 'steady' # Options: 'random', 'highest', 'steady', 'fixed'
     FIXED_DEMAND_VALUE = 80000 
-    
     
     demand_df = generate_five_year_demand_instance(
         simulation_mode=SIMULATION_MODE,
         fixed_demand=FIXED_DEMAND_VALUE 
     )
     
-    output_folder = "Task_3_Outcome"
+    output_folder = "Task_3_Outcome_Corrected"
     os.makedirs(output_folder, exist_ok=True)
 
     if not demand_df.empty:
-        print("\n\n--- Simulation Output ---")
-        actual_total_demand = len(demand_df)
-        print(f"Successfully generated {actual_total_demand:,} package demand instances over 5 years.")
-        demand_df.info()
-        print("\nSample of Generated Demand Data (First 5 rows):")
+        print("\n\n--- Simulation Output Summary ---")
+        print(f"Successfully generated {len(demand_df):,} package demand instances.")
+        
+        # --- Verification Step ---
+        print("\n--- Verification Checks ---")
+        for col in ["desired_deposit_dt", "desired_pickup_dt", "real_deposit_dt", "real_pickup_dt"]:
+            demand_df[col] = pd.to_datetime(demand_df[col])
+
+        # Check 1: Real Sojourn Time (Must be > 0)
+        demand_df["real_sojourn_hours"] = (demand_df["real_pickup_dt"] - demand_df["real_deposit_dt"]).dt.total_seconds() / 3600.0
+        min_real_sojourn = demand_df["real_sojourn_hours"].min()
+        print(f"Minimum Real Sojourn Hours: {min_real_sojourn:.4f}")
+        if min_real_sojourn <= 0:
+            print("❌ ERROR: Negative or zero real sojourn times detected!")
+        else:
+            print("✅ SUCCESS: All real sojourn times are positive (RP > RD).")
+
+        # Check 2: Real Deposit vs Desired Pickup Constraint (RD < DP)
+        deposit_pickup_diff = (demand_df["real_deposit_dt"] - demand_df["desired_pickup_dt"]).dt.total_seconds() / 60.0
+        max_diff = deposit_pickup_diff.max()
+        print(f"Max difference (Real Deposit - Desired Pickup) in minutes: {max_diff:.4f}")
+        # It should be negative (RD occurs before DP)
+        if max_diff > 0.01:
+             print("❌ ERROR: Real Deposit occurs significantly after Desired Pickup!")
+        else:
+             print("✅ SUCCESS: All real deposits occur before desired pickups (RD < DP).")
+
+        
+        # --- Output Generation ---
+        print("\nSample Data (First 5 rows):")
         print(demand_df.head())
         
-        # Modify filename to reflect the simulation mode
         filename = f"task3_demand_instance_{SIMULATION_MODE}_mode.csv"
         output_filepath = os.path.join(output_folder, filename)
         
-        demand_df.to_csv(output_filepath, index=False)
+        columns_to_save = ['package_id', 'min_size_ft3', 'desired_deposit_dt', 'desired_pickup_dt', 'real_deposit_dt', 'real_pickup_dt', 'real_sojourn_hours']
+        demand_df[columns_to_save].to_csv(output_filepath, index=False)
         print(f"\n✅ Full demand instance saved to '{output_filepath}'")
 
-        # ================================
-        # --- Section 4.1: Visualizations ---
-        # ================================
-        figs_dir = os.path.join(output_folder, f"figs_{SIMULATION_MODE}_mode")
-        os.makedirs(figs_dir, exist_ok=True)
-        
-        # Helper transforms
-        demand_df["sojourn_hours"] = (pd.to_datetime(demand_df["real_pickup_dt"]) - pd.to_datetime(demand_df["real_deposit_dt"])).dt.total_seconds() / 3600.0
-        for col in ["desired_deposit_dt", "desired_pickup_dt", "real_deposit_dt", "real_pickup_dt"]:
-            demand_df[col] = pd.to_datetime(demand_df[col])
-        demand_df["real_deposit_date"] = demand_df["real_deposit_dt"].dt.date
-        daily_counts = demand_df.groupby("real_deposit_date", as_index=False).size()
-        daily_counts.rename(columns={"size": "num_packages"}, inplace=True)
-        daily_counts["date"] = pd.to_datetime(daily_counts["real_deposit_date"])
-        daily_counts = daily_counts.sort_values("date")
-        daily_counts["roll28"] = daily_counts["num_packages"].rolling(28, min_periods=1).mean()
-
-        # Fig 6: Daily demand time series
-        plt.figure(figsize=(12, 6))
-        plt.plot(daily_counts["date"], daily_counts["num_packages"], linewidth=1, alpha=0.7, label="Daily Packages")
-        plt.plot(daily_counts["date"], daily_counts["roll28"], linewidth=2, color='red', label="28-Day Rolling Mean")
-        plt.title(f"Daily Packages (Real Deposit Date) - Mode: {SIMULATION_MODE.upper()}")
-        plt.xlabel("Date")
-        plt.ylabel("Packages per Day")
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.6)
-        fig_path = os.path.join(figs_dir, "06_daily_counts_roll28.png")
-        plt.tight_layout()
-        plt.savefig(fig_path, dpi=150)
-        # plt.show() # Commented out to prevent blocking in script
-        print(f"Saved: {fig_path}")
-
-        print(f"\n✅ Figures for this run saved under: {figs_dir}")
     else:
         print("\n--- Simulation resulted in an empty demand set. ---")
