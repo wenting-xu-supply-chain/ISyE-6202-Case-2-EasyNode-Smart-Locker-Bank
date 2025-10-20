@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
 # =========================
 # Ensure Task 3 output includes desired_deposit_dt and desired_pickup_dt
 INPUT_DEMAND_CSV = "Task_3_Outcome/task3_demand_instance_random_mode.csv"
-OUT_DIR = "Task_5_Outcome_Corrected"
+OUT_DIR = "Task_5_Outcome"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 GRID_HEIGHT = 15
@@ -396,6 +396,193 @@ def main():
         print(summary_text)
 
     print(f"\n✅ All simulations complete. Results are in '{OUT_DIR}'.")
+    # =========================
+    # === Visualization Suite ==
+    # =========================
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    def _safe_mkdir(path):
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _load_results_csv(tag: str):
+        csv_path = os.path.join(OUT_DIR, f"{tag}_results.csv")
+        if not os.path.exists(csv_path):
+            print(f"[VIS] WARNING: results CSV not found for tag={tag}: {csv_path}")
+            return None, csv_path
+        df = pd.read_csv(csv_path, parse_dates=['real_start','real_end'], keep_default_na=True)
+        return df, csv_path
+
+    def _capacity_from_size(series_size):
+        return series_size.map(LOCKER_CAPACITY_FT3)
+
+    def _fig_save(fig, out_path):
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+        print(f"[VIS] Saved: {out_path}")
+
+    def visualize_tag(tag: str):
+        df, csv_path = _load_results_csv(tag)
+        if df is None or df.empty:
+            return
+
+        figs_dir = _safe_mkdir(os.path.join(OUT_DIR, f"figs_{tag}"))
+
+        # 只用评估期
+        eval_df = df[df['keep_for_eval'] == True].copy()
+        if eval_df.empty:
+            print(f"[VIS] No eval data for {tag}.")
+            return
+
+        # ===== 0) 预处理 =====
+        eval_df['date'] = pd.to_datetime(eval_df['date'])
+        eval_df['accepted_flag'] = (eval_df['status'] == 'accepted').astype(int)
+        # 收入列可能是 float，缺失补 0
+        for c in ['revenue_base','revenue_size_upcharge','revenue_late_fee','ergonomic_cost','package_volume_ft3']:
+            if c in eval_df.columns:
+                eval_df[c] = pd.to_numeric(eval_df[c], errors='coerce').fillna(0.0)
+
+        # ===== 1) 每日服务水平（含 SLA 线） =====
+        daily = eval_df.groupby('date', as_index=False).agg(
+            total=('status','size'),
+            accepted=('accepted_flag','sum'),
+            base=('revenue_base','sum'),
+            upc=('revenue_size_upcharge','sum'),
+            late=('revenue_late_fee','sum')
+        )
+        daily['sl'] = np.where(daily['total']>0, daily['accepted']/daily['total'], np.nan)
+
+        fig, ax = plt.subplots(figsize=(12,5))
+        ax.plot(daily['date'], daily['sl'], lw=1.2, label='Daily Service Level')
+        ax.axhline(SLA_DAILY_TARGET, color='r', ls='--', lw=1.2, label=f'SLA Target {SLA_DAILY_TARGET:.3f}')
+        ax.set_ylim(0, 1.02)
+        ax.set_title(f"[{tag}] Daily Service Level (Evaluation Window)")
+        ax.set_xlabel("Date"); ax.set_ylabel("Service Level")
+        ax.grid(True, ls='--', alpha=0.5)
+        ax.legend()
+        _fig_save(fig, os.path.join(figs_dir, "01_daily_service_level.png"))
+
+        # ===== 2) 每日接收/拒单堆叠柱 =====
+        daily['rejected'] = daily['total'] - daily['accepted']
+        fig, ax = plt.subplots(figsize=(12,5))
+        ax.bar(daily['date'], daily['accepted'], label='Accepted')
+        ax.bar(daily['date'], daily['rejected'], bottom=daily['accepted'], label='Rejected', alpha=0.7)
+        ax.set_title(f"[{tag}] Accepted vs Rejected per Day")
+        ax.set_xlabel("Date"); ax.set_ylabel("Count")
+        ax.grid(True, ls='--', alpha=0.5)
+        ax.legend()
+        _fig_save(fig, os.path.join(figs_dir, "02_daily_accept_reject_stacked.png"))
+
+        # ===== 3) 需求尺寸 vs 分配尺寸 混淆矩阵 =====
+        conf_df = eval_df.copy()
+        conf_df['assigned_locker_size'] = conf_df['assigned_locker_size'].fillna('none')
+        sizes_order = ['small','medium','large','none']
+        conf = pd.crosstab(conf_df['required_size'], conf_df['assigned_locker_size']).reindex(index=['small','medium','large'], columns=sizes_order, fill_value=0)
+        fig, ax = plt.subplots(figsize=(6,5))
+        im = ax.imshow(conf.values, cmap='Blues')
+        ax.set_xticks(range(len(conf.columns))); ax.set_xticklabels(conf.columns)
+        ax.set_yticks(range(len(conf.index)));  ax.set_yticklabels(conf.index)
+        for i in range(conf.shape[0]):
+            for j in range(conf.shape[1]):
+                ax.text(j, i, int(conf.values[i,j]), ha='center', va='center', color='black', fontsize=9)
+        ax.set_title(f"[{tag}] Required vs Assigned (Confusion Matrix)")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        _fig_save(fig, os.path.join(figs_dir, "03_confusion_required_vs_assigned.png"))
+
+        # Oversize rate（仅统计 accepted）
+        acc = eval_df[eval_df['status']=='accepted'].copy()
+        if not acc.empty:
+            oversize_rate = (acc['assigned_locker_size'] != acc['required_size']).mean()
+            with open(os.path.join(figs_dir, "03A_oversize_rate.txt"), "w") as f:
+                f.write(f"Oversize Rate (accepted only): {oversize_rate:.4%}\n")
+            print(f"[VIS] Oversize Rate ({tag}): {oversize_rate:.2%}")
+
+        # ===== 4) 收入构成：总额 + 累计曲线 =====
+        totals = {
+            'Base': daily['base'].sum(),
+            'Upcharge': daily['upc'].sum(),
+            'LateFee': daily['late'].sum()
+        }
+        # 4a 条形图（总额）
+        fig, ax = plt.subplots(figsize=(6,5))
+        labs, vals = list(totals.keys()), list(totals.values())
+        ax.bar(labs, vals)
+        ax.set_title(f"[{tag}] Revenue Breakdown (Total)")
+        ax.set_ylabel("USD")
+        for i,v in enumerate(vals):
+            ax.text(i, v, f"${v:,.0f}", ha='center', va='bottom')
+        ax.grid(True, ls='--', alpha=0.4, axis='y')
+        _fig_save(fig, os.path.join(figs_dir, "04_revenue_breakdown_total.png"))
+
+        # 4b 累计收入曲线
+        daily['cum_revenue'] = (daily['base'] + daily['upc'] + daily['late']).cumsum()
+        fig, ax = plt.subplots(figsize=(12,5))
+        ax.plot(daily['date'], daily['cum_revenue'], lw=1.5)
+        ax.set_title(f"[{tag}] Cumulative Revenue")
+        ax.set_xlabel("Date"); ax.set_ylabel("USD (Cumulative)")
+        ax.grid(True, ls='--', alpha=0.5)
+        _fig_save(fig, os.path.join(figs_dir, "04B_cumulative_revenue.png"))
+
+        # ===== 5) 迟到费分布 =====
+        if (eval_df['revenue_late_fee'] > 0).any():
+            fig, ax = plt.subplots(figsize=(8,4))
+            ax.hist(eval_df['revenue_late_fee'][eval_df['revenue_late_fee']>0], bins=30)
+            ax.set_title(f"[{tag}] Late Fee Distribution (Per Job, >0)")
+            ax.set_xlabel("Late Fee (USD)"); ax.set_ylabel("Count")
+            ax.grid(True, ls='--', alpha=0.4)
+            _fig_save(fig, os.path.join(figs_dir, "05_late_fee_hist.png"))
+        else:
+            with open(os.path.join(figs_dir, "05_late_fee_hist.txt"), "w") as f:
+                f.write("No late fees in evaluation window.\n")
+
+        # ===== 6) 单件利用率分布（包裹体积/分配柜容积，仅accepted） =====
+        if not acc.empty:
+            acc['cap'] = _capacity_from_size(acc['assigned_locker_size'])
+            acc['util_ratio'] = np.where(acc['cap']>0, acc['package_volume_ft3']/acc['cap'], np.nan)
+            fig, ax = plt.subplots(figsize=(8,4))
+            ax.hist(acc['util_ratio'].dropna(), bins=40)
+            ax.set_title(f"[{tag}] Per-Job Volume Utilization (pkg_vol / locker_cap)")
+            ax.set_xlabel("Utilization Ratio"); ax.set_ylabel("Count")
+            ax.grid(True, ls='--', alpha=0.4)
+            _fig_save(fig, os.path.join(figs_dir, "06_utilization_ratio_hist.png"))
+
+        # ===== 7) 人机工效成本分布 =====
+        if 'ergonomic_cost' in eval_df.columns and (eval_df['ergonomic_cost']>0).any():
+            fig, ax = plt.subplots(figsize=(8,4))
+            ax.hist(eval_df['ergonomic_cost'][eval_df['ergonomic_cost']>0], bins=40)
+            ax.set_title(f"[{tag}] Ergonomic Cost Distribution (Per Job)")
+            ax.set_xlabel("Ergonomic Cost"); ax.set_ylabel("Count")
+            ax.grid(True, ls='--', alpha=0.4)
+            _fig_save(fig, os.path.join(figs_dir, "07_ergonomic_cost_hist.png"))
+        else:
+            with open(os.path.join(figs_dir, "07_ergonomic_cost_hist.txt"), "w") as f:
+                f.write("No positive ergonomic costs or column missing.\n")
+
+        # ===== 8) 按需求尺寸的接收率 =====
+        size_sl = eval_df.groupby('required_size').agg(
+            total=('status','size'),
+            acc=('accepted_flag','sum')
+        )
+        size_sl['sl'] = np.where(size_sl['total']>0, size_sl['acc']/size_sl['total'], np.nan)
+        size_sl = size_sl.reindex(['small','medium','large'])
+        fig, ax = plt.subplots(figsize=(6,4))
+        ax.bar(size_sl.index, size_sl['sl'])
+        ax.set_ylim(0,1.02); ax.set_title(f"[{tag}] Service Level by Required Size")
+        ax.set_ylabel("Service Level"); ax.grid(True, ls='--', alpha=0.4, axis='y')
+        for i, v in enumerate(size_sl['sl']):
+            if not np.isnan(v):
+                ax.text(i, v, f"{v:.1%}", ha='center', va='bottom')
+        _fig_save(fig, os.path.join(figs_dir, "08_service_level_by_required_size.png"))
+
+    def visualize_all_tags(tags):
+        print("\n--- Generating visualizations ---")
+        for tag in tags:
+            visualize_tag(tag)
+        print("--- Visualization complete. ---")
+    visualize_all_tags([tag for tag, _ in simulations_to_run])
+
 
 if __name__ == '__main__':
     main()
