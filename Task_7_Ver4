@@ -61,7 +61,7 @@ RNG = np.random.default_rng(RANDOM_SEED) # Use modern NumPy RNG
 random.seed(RANDOM_SEED)
 
 R_D = {'small': 6.10, 'medium': 11.95, 'large': 16.35}
-C_L = {'small': 0.0, 'medium': 0.0, 'large': 0.0}
+C_L = {'small': 91.0, 'medium': 182.0, 'large': 273.0}
 C_M = 50.0; C_W = 500.0; C_S = 50.0
 
 AMORT_LAMBDA = 1.0
@@ -813,4 +813,4 @@ if __name__ == "__main__":
         pass # Start method already set
     
     # Uncomment the following line to run the task
-    run_task7()
+    # run_task7()
