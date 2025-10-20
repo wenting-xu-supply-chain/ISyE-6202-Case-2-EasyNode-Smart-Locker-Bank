@@ -484,3 +484,152 @@ if __name__ == '__main__':
 
     else:
         print("\n--- Simulation resulted in an empty demand set. ---")
+
+# =============================================================================
+# --- Section 5+ : Polished Visualization Suite (Pretty & Aligned) ---
+# =============================================================================
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.ticker import MaxNLocator
+
+PRETTY_DIR = os.path.join(output_folder, "viz")
+os.makedirs(PRETTY_DIR, exist_ok=True)
+
+# --------- Global style (matplotlib only, no external themes) ----------
+plt.rcParams.update({
+    "figure.dpi": 140,
+    "savefig.dpi": 180,
+    "font.size": 11,
+    "axes.labelsize": 11,
+    "axes.titlesize": 13,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "figure.autolayout": False,  # we'll call tight_layout() each figure
+})
+
+# Ensure datetime dtypes
+for _c in ["desired_deposit_dt","desired_pickup_dt","real_deposit_dt","real_pickup_dt"]:
+    demand_df[_c] = pd.to_datetime(demand_df[_c])
+
+# =============================================================================
+# 1) Daily demand time series (每日日志序列)
+# =============================================================================
+daily_counts = demand_df["real_deposit_dt"].dt.floor("D").value_counts().sort_index()
+# smooth (optional): 7-day moving average for readability
+ma7 = daily_counts.rolling(7, min_periods=1).mean()
+
+fig = plt.figure(figsize=(12, 4.2))
+ax = plt.gca()
+ax.plot(daily_counts.index, daily_counts.values, linewidth=1.0)
+ax.plot(ma7.index, ma7.values, linewidth=1.6)
+ax.set_title("Daily Deposits Over 5 Years")
+ax.set_xlabel("Date")
+ax.set_ylabel("# Deposits")
+ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+ax.xaxis.set_major_locator(mdates.YearLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune="both"))
+fig.tight_layout()
+fig.savefig(os.path.join(PRETTY_DIR, "01_daily_deposits_timeseries.png"))
+plt.close(fig)
+
+# =============================================================================
+# 2) Deposit vs Pickup Hour Joint Heatmap (基于 Table 3 的转移概率)
+# =============================================================================
+# 使用你脚本里的 DEPOSIT_PICKUP_MATRIX，先行归一化到条件概率 P(p|d)
+mat = DEPOSIT_PICKUP_MATRIX.astype(float).copy()
+row_sum = mat.sum(axis=1, keepdims=True)
+with np.errstate(invalid="ignore", divide="ignore"):
+    prob_mat = np.divide(mat, row_sum, where=row_sum!=0)
+prob_mat = np.nan_to_num(prob_mat)
+
+fig = plt.figure(figsize=(7.8, 6.8))
+ax = plt.gca()
+im = ax.imshow(prob_mat, aspect="auto", origin="lower")  # default colormap
+ax.set_title("Deposit Hour → Pickup Hour (Probability Heatmap)\nBased on Table 3")
+ax.set_xlabel("Pickup Hour (0–23)")
+ax.set_ylabel("Deposit Hour (0–23)")
+ax.set_xticks(range(0,24,2))
+ax.set_yticks(range(0,24,2))
+cbar = fig.colorbar(im, ax=ax)
+cbar.ax.set_ylabel("P(pickup hour | deposit hour)", rotation=90)
+# 辅助网格（刻度对齐）
+ax.set_xticks(range(0,24,1), minor=True)
+ax.set_yticks(range(0,24,1), minor=True)
+ax.grid(which="minor", linestyle=":", linewidth=0.4, alpha=0.5)
+fig.tight_layout()
+fig.savefig(os.path.join(PRETTY_DIR, "02_dp_hour_joint_heatmap_table3.png"))
+plt.close(fig)
+
+# =============================================================================
+# 3) Size Distribution Histogram (需求尺寸分布直方图，ft³)
+# =============================================================================
+sizes = demand_df["min_size_ft3"]
+fig = plt.figure(figsize=(8.8, 4.2))
+ax = plt.gca()
+bins = np.arange(0.5, 18.5 + 1e-9, 1.0)
+ax.hist(sizes, bins=bins, rwidth=0.88)
+ax.set_title("Package Size Distribution (ft³)")
+ax.set_xlabel("ft³")
+ax.set_ylabel("Count")
+ax.set_xticks(range(1, 19, 1))
+ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
+fig.tight_layout()
+fig.savefig(os.path.join(PRETTY_DIR, "03_size_distribution_hist.png"))
+plt.close(fig)
+
+# =============================================================================
+# 4) Single-Day Gantt (验证 RD→RP 逻辑)
+#    选择样本最多的一天；若过多，仅展示前 N 条避免视觉拥挤
+# =============================================================================
+day_counts = demand_df["real_deposit_dt"].dt.floor("D").value_counts()
+peak_day = day_counts.idxmax() if not day_counts.empty else None
+
+if peak_day is not None:
+    one_day_mask = demand_df["real_deposit_dt"].dt.floor("D") == peak_day
+    day_df = demand_df.loc[one_day_mask, ["package_id","real_deposit_dt","real_pickup_dt"]].copy()
+    # 保序：按 deposit 时间排序
+    day_df.sort_values("real_deposit_dt", inplace=True)
+
+    # 最多展示 N 条
+    N_MAX = 80
+    if len(day_df) > N_MAX:
+        day_df = day_df.head(N_MAX)
+
+    # 准备绘图数据：每条 task 的开始时间与持续时长（小时）
+    start = day_df["real_deposit_dt"]
+    end   = day_df["real_pickup_dt"]
+    dur_hours = (end - start).dt.total_seconds() / 3600.0
+
+    # y 轴：0..(n-1)
+    y_positions = np.arange(len(day_df))
+
+    fig = plt.figure(figsize=(12.5, 8.0))
+    ax = plt.gca()
+    # 将时间转换成 matplotlib float 时间以 barh 使用
+    # 方案：用 ax.plot_date 或直接用 barh + left=数值化
+    # 简洁做法：把 x 轴当成 datetime，使用 ax.broken_barh 需要数值；这里用 barh+left=matplotlib日期数：
+    start_num = mdates.date2num(start)
+    width_num = (end - start).dt.total_seconds() / (24*3600.0)  # 天为单位的宽度
+    for y, left, w in zip(y_positions, start_num, width_num):
+        ax.barh(y, w, left=left, height=0.8, align="center")
+
+    # 轴样式
+    ax.set_title(f"Gantt of In-Locker Usage (Peak Day: {pd.to_datetime(peak_day).date()}, showing {len(day_df)} pkgs)")
+    ax.set_xlabel("Time (Hour)")
+    ax.set_ylabel("Package Index (sorted by deposit)")
+    ax.set_yticks([])  # 只保留“密度感”，不显示每条的编号，避免杂乱
+    ax.grid(True, axis="x", linestyle="--", linewidth=0.5, alpha=0.6)
+    # 时间刻度每 2 小时
+    ax.xaxis_date()
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(os.path.join(PRETTY_DIR, "04_single_day_gantt_peak.png"))
+    plt.close(fig)
+
+print(f"[Pretty Visualization] Exported to: {PRETTY_DIR}")
