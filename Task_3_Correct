@@ -8,24 +8,21 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 # =============================================================================
-# --- Section 1: Constants from Casework Document ---
+# --- Section 1: Constants from Casework Document and New Logic ---
 # =============================================================================
 # Demand variability
 PERIOD_CV = 0.2
 DAILY_DEMAND_CV = 0.25
 
 # Time variability (Casework Page 3-4)
-DEPOSIT_OFFSET_MIN = -1.5  # 90 minutes early
-DEPOSIT_OFFSET_MAX = 180.0 # 180 hours late
+DEPOSIT_OFFSET_MIN = -1.5  # 90 minutes early (Used for DD -> RD)
+DEPOSIT_OFFSET_MAX = 180.0 # 180 hours late (Used for DD -> RD)
 
-# Assumed pickup variability (Not explicitly defined in casework, assumed based on original code)
-PICKUP_OFFSET_MIN = -6.0
-PICKUP_OFFSET_MAX = 6.0
+# New Logic: Fixed window for Desired Pickup (RD -> DP)
+FIXED_DESIRED_WINDOW = datetime.timedelta(hours=5)
 
-# Minimum time a package must stay in the locker (Ensures RD < RP)
+# Minimum time a package must stay in the locker (Safety check if RD and RP are in the same hour)
 MINIMUM_SOJOURN = datetime.timedelta(minutes=5)
-# Buffer time to ensure RD < DP (Casework requirement)
-DEPOSIT_BUFFER = datetime.timedelta(minutes=5)
 
 
 # Table 1: Package Size Probability
@@ -94,10 +91,12 @@ DEPOSIT_PICKUP_MATRIX = np.array([
 ], dtype=float)
 
 # Calculate Daily deposit distribution (Sum of the rows)
+# This distribution is used to generate the initial Desired Deposit Time (DD)
 DAILY_DEPOSIT_DIST = DEPOSIT_PICKUP_MATRIX.sum(axis=1)
 DEPOSIT_HOUR_PROBS = DAILY_DEPOSIT_DIST / DAILY_DEPOSIT_DIST.sum()
 
 # Calculate conditional probabilities P(p|d)
+# This matrix is used to generate Real Pickup Time (RP) based on Real Deposit Time (RD)
 row_sums_d = DAILY_DEPOSIT_DIST.reshape(-1, 1)
 CONDITIONAL_PICKUP_PROBS_MATRIX = np.divide(
     DEPOSIT_PICKUP_MATRIX,
@@ -116,7 +115,7 @@ START_YEAR = 2026
 def _generate_intra_hour_arrival_minutes(N, lsp_proportion=0.8, lsp_mean=15, lsp_std=5):
     """
     Generates arrival minutes within an hour (Task 2 logic).
-    LSPs (Logistic Service Provider) tend to arrive earlier, Customers are uniform.
+    LSPs tend to arrive earlier, Customers are uniform.
     """
     if N <= 0: return []
     n_lsp = int(round(N * lsp_proportion))
@@ -201,88 +200,83 @@ def _calculate_expected_annual_demands(tree: dict, demands: dict) -> list[int]:
 
 def _generate_packages_for_one_day(num_packages: int, date: datetime.date) -> list[dict]:
     """
-    Generates package details for a single day.
-    *** THIS FUNCTION CONTAINS THE CORRECTED LOGIC ***
+    Generates package details for a single day using the NEW requested logic.
+    Logic Flow: DD -> RD -> RP -> DP
     """
     if num_packages <= 0: return []
     package_list = []
     
-    # --- Generate Sizes and Desired Deposit Times (DD) ---
+    # --- Setup: Generate Sizes and Initial Desired Deposit Times (DD) ---
     required_sizes = np.random.choice(SIZES, size=num_packages, p=SIZE_PROBS)
+    
+    # Step 1: Generate Desired Deposit (DD) based on hourly probabilities
     deposit_hours = np.random.choice(24, size=num_packages, p=DEPOSIT_HOUR_PROBS)
     hourly_deposit_counts = pd.Series(deposit_hours).value_counts().to_dict()
     
-    all_deposit_datetimes = []
+    all_desired_deposit_datetimes = []
     for hour, count in hourly_deposit_counts.items():
         arrival_minutes = _generate_intra_hour_arrival_minutes(count)
         for minute in arrival_minutes:
-            # Create datetime objects robustly
             try:
+                # Create the datetime object for the DD
                 base_time = datetime.datetime(year=date.year, month=date.month, day=date.day, hour=hour)
-                all_deposit_datetimes.append(base_time + datetime.timedelta(minutes=minute))
+                all_desired_deposit_datetimes.append(base_time + datetime.timedelta(minutes=minute))
             except Exception as e:
                 print(f"Warning: Could not create datetime for {date} hour {hour}. Skipping package. Error: {e}")
                 continue
 
-    random.shuffle(all_deposit_datetimes)
+    random.shuffle(all_desired_deposit_datetimes)
     
     # --- Iterate package by package ---
-    for i in range(len(all_deposit_datetimes)):
+    for i in range(len(all_desired_deposit_datetimes)):
         
         # 1. Get Desired Deposit Time (DD)
-        desired_deposit_dt = all_deposit_datetimes[i]
-        deposit_hour_d = desired_deposit_dt.hour
+        desired_deposit_dt = all_desired_deposit_datetimes[i]
         
-        # 2. Generate Desired Pickup Time (DP)
-        conditional_probs = CONDITIONAL_PICKUP_PROBS_MATRIX[deposit_hour_d]
-        pickup_hour_p = np.random.choice(24, p=conditional_probs)
-        pickup_minute = np.random.uniform(0, 59.99)
-        
-        pickup_date = desired_deposit_dt.date()
-        
-        # Apply next-day rule (ensures DD < DP)
-        if pickup_hour_p < deposit_hour_d: 
-            pickup_date += datetime.timedelta(days=1)
-        
-        try:
-            base_pickup_time = datetime.datetime(year=pickup_date.year, month=pickup_date.month, day=pickup_date.day, hour=pickup_hour_p)
-            desired_pickup_dt = base_pickup_time + datetime.timedelta(minutes=pickup_minute)
-        except Exception as e:
-            print(f"Warning: Could not create pickup datetime. Skipping package. Error: {e}")
-            continue
-
-        # Edge case check: Ensure DD < DP even if hours are the same but minutes cause overlap
-        if desired_pickup_dt <= desired_deposit_dt:
-             desired_pickup_dt = desired_deposit_dt + MINIMUM_SOJOURN
-
-        # 3. Generate Real Deposit Time (RD)
+        # 2. Generate Real Deposit Time (RD) = DD + offset
         deposit_offset_hours = random.uniform(DEPOSIT_OFFSET_MIN, DEPOSIT_OFFSET_MAX)
-        potential_real_deposit_dt = desired_deposit_dt + datetime.timedelta(hours=deposit_offset_hours)
-        
-        # Constraint 1: RD must be before DP (Casework requirement)
-        # Enforce RD < DP - Buffer
-        if potential_real_deposit_dt >= (desired_pickup_dt - DEPOSIT_BUFFER):
-            # If deposit is too late, cap it just before desired pickup
-            real_deposit_dt = desired_pickup_dt - DEPOSIT_BUFFER
-        else:
-            real_deposit_dt = potential_real_deposit_dt
+        real_deposit_dt = desired_deposit_dt + datetime.timedelta(hours=deposit_offset_hours)
             
-        # 4. Generate Real Pickup Time (RP)
-        pickup_offset_hours = random.uniform(PICKUP_OFFSET_MIN, PICKUP_OFFSET_MAX) 
-        potential_real_pickup_dt = desired_pickup_dt + datetime.timedelta(hours=pickup_offset_hours)
+        # 3. Generate Real Pickup Time (RP) based on RD + Matrix
+        rd_hour = real_deposit_dt.hour
         
-        # Constraint 2: RP must be AFTER RD (Physical requirement) - THE FIX
-        # Enforce RP > RD + Minimum Sojourn
-        if potential_real_pickup_dt <= (real_deposit_dt + MINIMUM_SOJOURN):
-            # If pickup attempt is before deposit, force it to happen just after the deposit
-            real_pickup_dt = real_deposit_dt + MINIMUM_SOJOURN
-        else:
-            real_pickup_dt = potential_real_pickup_dt
+        # Get the conditional probability row P(p|d) using the REAL deposit hour
+        conditional_probs = CONDITIONAL_PICKUP_PROBS_MATRIX[rd_hour]
+        
+        # Sample the pickup hour 'p'
+        rp_hour = np.random.choice(24, p=conditional_probs)
+        # Sample the pickup minute uniformly within the hour
+        rp_minute = np.random.uniform(0, 59.99)
+        
+        rp_date = real_deposit_dt.date()
+        
+        # Apply next-day rule if pickup hour is earlier than deposit hour (Table 3 logic)
+        if rp_hour < rd_hour: 
+            rp_date += datetime.timedelta(days=1)
+            
+        try:
+            base_pickup_time = datetime.datetime(year=rp_date.year, month=rp_date.month, day=rp_date.day, hour=rp_hour)
+            real_pickup_dt = base_pickup_time + datetime.timedelta(minutes=rp_minute)
+        except Exception as e:
+             print(f"Warning: Could not create Real Pickup datetime. Skipping package. Error: {e}")
+             continue
 
-        # Final check
+        # Edge case check: Ensure RD < RP. 
+        # If RD and RP are in the same hour, the randomly generated minutes might cause inversion.
+        if real_pickup_dt <= real_deposit_dt:
+             # If inversion occurs, force RP to be shortly after RD.
+             real_pickup_dt = real_deposit_dt + MINIMUM_SOJOURN
+
+        # 4. Generate Desired Pickup Time (DP) = RD + Fixed Window
+        desired_pickup_dt = real_deposit_dt + FIXED_DESIRED_WINDOW
+
+
+        # Final assertion (should always pass due to step 3 checks)
         assert real_pickup_dt > real_deposit_dt, "Sojourn time constraint failed!"
 
         # 5. Append the package
+        # We use the i-th size for the i-th successful package generation.
+        # This is statistically sound as sizes are i.i.d.
         package_list.append({
             'min_size_ft3': required_sizes[i], 
             'desired_deposit_dt': desired_deposit_dt,
@@ -321,17 +315,21 @@ def generate_five_year_demand_instance(
     print(f"Annual Demand Targets: {annual_demands}")
 
     # --- Setup Date Range Template ---
+    # We use the Start Year to define the initial 5-year simulation period for demand generation
     start_date = datetime.date(START_YEAR, 1, 1)
+    # The simulation ends at the stroke of midnight when the 5th year finishes
     end_date = datetime.date(START_YEAR + 5, 1, 1) - datetime.timedelta(days=1)
     date_range = pd.to_datetime(pd.date_range(start=start_date, end=end_date, freq='D'))
     
     daily_demand_df = pd.DataFrame(date_range, columns=['date'])
     daily_demand_df['year'] = daily_demand_df['date'].dt.year
+    # Calculate the 28-day period (1-13), handling day-of-year correctly
     daily_demand_df['period'] = ((daily_demand_df['date'].dt.dayofyear - 1) // 28) + 1
     daily_demand_df['period'] = daily_demand_df['period'].clip(upper=13)
     daily_demand_df['day_of_week'] = daily_demand_df['date'].dt.dayofweek
     
     # --- Simulate Daily Demand (Table 2 logic) ---
+    # This section distributes the annual demand down to the daily level based on period and DOW shares/CVs.
     all_years_dfs = []
     for year_idx, total_annual_demand in enumerate(annual_demands):
         year = START_YEAR + year_idx
@@ -356,8 +354,10 @@ def generate_five_year_demand_instance(
                     period_df['daily_share_of_period'] = period_df['dow_share'] / total_dow_share_in_period
                     period_df['expected_daily'] = simulated_period_demand * period_df['daily_share_of_period']
                 else:
+                    # Fallback if shares are somehow zero (should not happen with provided data)
                     period_df['expected_daily'] = simulated_period_demand / len(period_df)
                 
+                # Apply Daily CV
                 daily_std_dev = period_df['expected_daily'] * DAILY_DEMAND_CV
                 period_df['simulated_daily'] = np.random.normal(period_df['expected_daily'], daily_std_dev)
                 period_df['simulated_daily'] = period_df['simulated_daily'].fillna(0).round().astype(int).clip(lower=0)
@@ -379,9 +379,11 @@ def generate_five_year_demand_instance(
                 # Handle remainder due to rounding
                 remainder = simulated_period_demand - period_df['final_daily_demand'].sum()
                 if remainder != 0:
+                    # Distribute the remainder randomly across the days in the period
                     indices = np.random.choice(period_df.index, size=abs(int(remainder)), replace=True)
                     adjustment = 1 if remainder > 0 else -1
                     for idx in indices:
+                        # Ensure demand doesn't drop below zero if subtracting
                         if period_df.loc[idx, 'final_daily_demand'] + adjustment >= 0:
                             period_df.loc[idx, 'final_daily_demand'] += adjustment
 
@@ -401,10 +403,11 @@ def generate_five_year_demand_instance(
     # --- Generate Individual Package Details ---
     all_packages = []
     print("\nGenerating individual package details for each day...")
+    # Iterate over the daily demand schedule. The 'date' here is the date for the initial Desired Deposit.
     for _, row in tqdm(final_demand_schedule.iterrows(), total=len(final_demand_schedule), desc="Daily Progress"):
         num_packages_today = row['final_daily_demand']
         if num_packages_today > 0:
-            # Call the corrected function
+            # Call the function with the modified logic
             packages_today = _generate_packages_for_one_day(int(num_packages_today), row['date'].date())
             all_packages.extend(packages_today)
             
@@ -421,11 +424,11 @@ def generate_five_year_demand_instance(
 # --- Section 4: Execution Block (Example Usage and Verification) ---
 # =============================================================================
 if __name__ == '__main__':
-    # Set seed for reproducibility if needed
+    # Set seed for reproducibility if desired
     # np.random.seed(42)
     # random.seed(42)
 
-    SIMULATION_MODE = 'steady' # Options: 'random', 'highest', 'steady', 'fixed'
+    SIMULATION_MODE = 'random' # Options: 'random', 'highest', 'steady', 'fixed'
     FIXED_DEMAND_VALUE = 80000 
     
     demand_df = generate_five_year_demand_instance(
@@ -433,7 +436,7 @@ if __name__ == '__main__':
         fixed_demand=FIXED_DEMAND_VALUE 
     )
     
-    output_folder = "Task_3_Outcome_Corrected"
+    output_folder = "Task_3_Outcome"
     os.makedirs(output_folder, exist_ok=True)
 
     if not demand_df.empty:
@@ -441,11 +444,11 @@ if __name__ == '__main__':
         print(f"Successfully generated {len(demand_df):,} package demand instances.")
         
         # --- Verification Step ---
-        print("\n--- Verification Checks ---")
+        print("\n--- Verification Checks (Based on New Logic) ---")
         for col in ["desired_deposit_dt", "desired_pickup_dt", "real_deposit_dt", "real_pickup_dt"]:
             demand_df[col] = pd.to_datetime(demand_df[col])
 
-        # Check 1: Real Sojourn Time (Must be > 0)
+        # Check 1: Real Sojourn Time (Must be > 0) (RP > RD)
         demand_df["real_sojourn_hours"] = (demand_df["real_pickup_dt"] - demand_df["real_deposit_dt"]).dt.total_seconds() / 3600.0
         min_real_sojourn = demand_df["real_sojourn_hours"].min()
         print(f"Minimum Real Sojourn Hours: {min_real_sojourn:.4f}")
@@ -454,15 +457,18 @@ if __name__ == '__main__':
         else:
             print("✅ SUCCESS: All real sojourn times are positive (RP > RD).")
 
-        # Check 2: Real Deposit vs Desired Pickup Constraint (RD < DP)
-        deposit_pickup_diff = (demand_df["real_deposit_dt"] - demand_df["desired_pickup_dt"]).dt.total_seconds() / 60.0
-        max_diff = deposit_pickup_diff.max()
-        print(f"Max difference (Real Deposit - Desired Pickup) in minutes: {max_diff:.4f}")
-        # It should be negative (RD occurs before DP)
-        if max_diff > 0.01:
-             print("❌ ERROR: Real Deposit occurs significantly after Desired Pickup!")
+        # Check 2: Desired Pickup vs Real Deposit (DP = RD + Fixed Window)
+        desired_window_check = (demand_df["desired_pickup_dt"] - demand_df["real_deposit_dt"]).dt.total_seconds() / 3600.0
+        min_window = desired_window_check.min()
+        max_window = desired_window_check.max()
+        target_window_hours = FIXED_DESIRED_WINDOW.total_seconds() / 3600.0
+        print(f"Desired Window (DP - RD) Hours: Min={min_window:.4f}, Max={max_window:.4f}, Target={target_window_hours:.1f}")
+        
+        # Allowing a small tolerance for floating point comparison
+        if abs(min_window - target_window_hours) < 0.001 and abs(max_window - target_window_hours) < 0.001:
+             print("✅ SUCCESS: Desired pickup time is correctly fixed relative to real deposit (DP = RD + Window).")
         else:
-             print("✅ SUCCESS: All real deposits occur before desired pickups (RD < DP).")
+             print("❌ ERROR: Desired pickup time window mismatch!")
 
         
         # --- Output Generation ---
