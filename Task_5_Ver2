@@ -59,7 +59,7 @@ WARMUP_DAYS = 2.0
 # --- Task 7 Economic & Objective Parameters ---
 # ==========================================================
 R_D = {'small': 6.10, 'medium': 11.95, 'large': 16.35}
-C_L = {'small': 0, 'medium': 0, 'large': 0}
+C_L = {'small': 91, 'medium': 182, 'large': 273}
 C_M = 50.0; C_W = 500.0; C_S = 50.0
 # FIX: Amortization factor set to 1.0.
 AMORT_LAMBDA = 1.0
